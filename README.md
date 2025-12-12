@@ -266,6 +266,55 @@ A community-curated list of Depth Anything 3 integrations across 3D tools, creat
 - [VideoDepthViewer3D](https://github.com/amariichi/VideoDepthViewer3D): Streaming videos with DA3 metric depth to a Three.js/WebXR 3D viewer for VR/stereo playback.
 
 
+## 🧑‍💻 Official Codebase Core Contributors and Maintainers
+
+<table>
+  <tr>
+    <td align="center">
+      <a href="https://bingykang.github.io/">
+        <img src="https://images.weserv.nl/?url=https://bingykang.github.io/images/bykang_homepage.jpeg?h=100&w=100&fit=cover&mask=circle&maxage=7d" width="100px;" alt=""/>
+      </a>
+        <br />
+        <sub><b>Bingyi Kang</b></sub>
+    </td>
+    <td align="center">
+      <a href="https://haotongl.github.io/">
+        <img src="https://images.weserv.nl/?url=https://haotongl.github.io/assets/img/prof_pic.jpg?h=100&w=100&fit=cover&mask=circle&maxage=7d" width="100px;" alt=""/>
+      </a>
+        <br />
+        <sub>Haotong Lin</sub>
+    </td>
+    <td align="center">
+      <a href="https://github.com/SiliChen321">
+        <img src="https://images.weserv.nl/?url=https://avatars.githubusercontent.com/u/195901058?v=4&h=100&w=100&fit=cover&mask=circle&maxage=7d" width="100px;" alt=""/>
+      </a>
+        <br />
+        <sub>Sili Chen</sub>
+    </td>
+    <td align="center">
+      <a href="https://liewjunhao.github.io/">
+        <img src="https://images.weserv.nl/?url=https://liewjunhao.github.io/images/liewjunhao.png?h=100&w=100&fit=cover&mask=circle&maxage=7d" width="100px;" alt=""/>
+       </a>
+        <br />
+        <sub>Jun Hao Liew</sub>
+    </td>
+    <td align="center">
+      <a href="https://donydchen.github.io/">
+        <img src="https://images.weserv.nl/?url=https://donydchen.github.io/assets/img/profile.jpg?h=100&w=100&fit=cover&mask=circle&maxage=7d" width="100px;" alt=""/>
+      </a>
+        <br />
+        <sub>Donny Y. Chen</sub>
+    </td>
+    <td align="center">
+      <a href="https://github.com/DengKaiCQ">
+        <img src="https://images.weserv.nl/?url=https://avatars.githubusercontent.com/u/59907452?v=4&h=100&w=100&fit=cover&mask=circle&maxage=7d" width="100px;" alt=""/>
+      </a>
+        <br />
+        <sub>Kai Deng</sub>
+    </td>
+  </tr>
+</table>
+
 ## 📝 Citations
 If you find Depth Anything 3 useful in your research or projects, please cite our work:
 
