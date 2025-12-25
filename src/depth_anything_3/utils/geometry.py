@@ -253,11 +253,27 @@ def transform_rigid(
     transformation: torch.Tensor,  # "*#batch dim dim"
 ) -> torch.Tensor:  # "*batch dim"
     """Apply a rigid-body transformation to points or vectors."""
-    return einsum(
-        transformation,
-        homogeneous_coordinates.to(transformation.dtype),
-        "... i j, ... j -> ... i",
+    # Original einsum operation (commented out for ROCm/HIP compatibility)
+    # return einsum(
+    #     transformation,
+    #     homogeneous_coordinates.to(transformation.dtype),
+    #     "... i j, ... j -> ... i",
+    # )
+
+    # ROCm/HIP compatible version - manual matrix-vector multiplication
+    # This avoids einsum which uses HIPBLAS batched operations
+    coords = homogeneous_coordinates.to(transformation.dtype)
+    # Manual computation: result[i] = sum_j(transformation[i,j] * coords[j])
+    result = torch.stack(
+        [
+            (transformation[..., 0, :] * coords).sum(dim=-1),
+            (transformation[..., 1, :] * coords).sum(dim=-1),
+            (transformation[..., 2, :] * coords).sum(dim=-1),
+            (transformation[..., 3, :] * coords).sum(dim=-1),
+        ],
+        dim=-1,
     )
+    return result
 
 
 def transform_cam2world(
@@ -277,10 +293,21 @@ def unproject(
 
     # Apply the inverse intrinsics to the coordinates.
     coordinates = homogenize_points(coordinates)
-    ray_directions = einsum(
-        intrinsics.float().inverse().to(intrinsics),
-        coordinates.to(intrinsics.dtype),
-        "... i j, ... j -> ... i",
+
+    # Original einsum operation (commented out for ROCm/HIP compatibility)
+    # ray_directions = einsum(
+    #     intrinsics.float().inverse().to(intrinsics),
+    #     coordinates.to(intrinsics.dtype),
+    #     "... i j, ... j -> ... i",
+    # )
+
+    # ROCm/HIP compatible version - use torch.linalg.solve instead of inverse + matmul
+    # This avoids both matrix inversion and batched GEMM operations which fail on HIPBLAS
+    # Solving: intrinsics @ ray_directions = coordinates
+    ray_directions = (
+        torch.linalg.solve(intrinsics.float(), coordinates.float().unsqueeze(-1))
+        .squeeze(-1)
+        .to(intrinsics.dtype)
     )
 
     # Apply the supplied depth values.
@@ -318,7 +345,18 @@ def get_fov(intrinsics: torch.Tensor) -> torch.Tensor:  # "batch 3 3" -> "batch 
 
     def process_vector(vector):
         vector = torch.tensor(vector, dtype=intrinsics.dtype, device=intrinsics.device)
-        vector = einsum(intrinsics_inv, vector, "b i j, j -> b i")
+        # Original einsum operation (commented out for ROCm/HIP compatibility)
+        # vector = einsum(intrinsics_inv, vector, "b i j, j -> b i")
+
+        # ROCm/HIP compatible version - manual matrix-vector multiplication
+        vector = torch.stack(
+            [
+                (intrinsics_inv[:, 0, :] * vector).sum(dim=-1),
+                (intrinsics_inv[:, 1, :] * vector).sum(dim=-1),
+                (intrinsics_inv[:, 2, :] * vector).sum(dim=-1),
+            ],
+            dim=-1,
+        )
         return vector / vector.norm(dim=-1, keepdim=True)
 
     left = process_vector([0, 0.5, 1])
@@ -348,13 +386,16 @@ def map_pdf_to_opacity(
     # Map the probability density to an opacity.
     return 0.5 * (1 - (1 - pdf) ** exponent + pdf ** (1 / exponent))
 
+
 def normalize_homogenous_points(points):
     """Normalize the point vectors"""
     return points / points[..., -1:]
 
+
 def inverse_intrinsic_matrix(ixts):
     """ """
     return torch.inverse(ixts)
+
 
 def pixel_space_to_camera_space(pixel_space_points, depth, intrinsics):
     """
