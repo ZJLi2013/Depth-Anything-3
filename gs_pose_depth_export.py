@@ -4,13 +4,34 @@ import json
 from depth_anything_3.api import DepthAnything3
 
 """
-Depth Anything 3: Gaussian Splatting with per-image camera pose and relative depth export.
-This script supersedes 'basic_gs.py' with a more descriptive name.
+Depth Anything 3: Gaussian Splatting with per-image camera pose and metric depth export.
+
+Outputs written alongside GS results (export_dir/gs_ply, default: ./output/gs_ply):
+- GS PLY:
+  - Path example: ./output/gs_ply/0000.ply
+  - Produced by export_format="gs_ply" via model export; contains 3D Gaussians.
+
+- metric_depth_{index}.npy:
+  - H x W, float32 array of per-pixel depth (camera-space Z), metric-like (meters) from DA3NESTED-GIANT-LARGE.
+  - The nested model sets output.is_metric = 1 and output.scale_factor after alignment.
+
+- metric_depth_{index}.png:
+  - 16-bit visualization, min-max normalized per image to [0, 65535].
+  - For viewing only; values are not meant for quantitative comparison across images.
+
+- cam_pose_{index}.json:
+  - {"image_path": str, "intrinsics_3x3": [[...]], "extrinsics_3x4_w2c": [[...]]}
+  - intrinsics_3x3 is camera intrinsics (fx,0,cx; 0,fy,cy; 0,0,1).
+  - extrinsics_3x4_w2c is world-to-camera (OpenCV/Colmap convention), shape (3,4).
+
+Notes:
+- prediction.is_metric=1 and prediction.scale_factor are set by the nested model alignment.
+- When extrinsics/intrinsics are provided to inference(..., align_to_input_ext_scale=True), prediction.depth is further aligned to the physical scale of the input poses.
 """
 
 # Parse command line arguments
 parser = argparse.ArgumentParser(
-    description="Depth Anything 3: GS with per-image camera pose and relative depth export"
+    description="Depth Anything 3: GS with per-image camera pose and metric depth export"
 )
 parser.add_argument(
     "--input-images",
@@ -45,7 +66,7 @@ if len(images) == 0:
 prediction = model.inference(
     images,
     infer_gs=True,  # Enable Gaussian Splatting branch
-    export_dir="./output_gs",  # Directory to save GS outputs
+    export_dir="./output",  # Directory to save GS outputs
     export_format="gs_ply",  # Export GS format (can also use "gs_ply-gs_video" for both)
 )
 
@@ -66,7 +87,7 @@ print("Intrinsics shape:", prediction.intrinsics.shape)
 if hasattr(prediction, "gaussians"):
     print("\nGaussian Splatting data available in prediction.gaussians")
     print("GS means shape:", prediction.gaussians.means.shape)
-    print("GS PLY file exported to: ./output_gs/gs_ply/0000.ply")
+    print("GS PLY file exported to: ./output/gs_ply/0000.ply")
 else:
     print("\nWarning: No Gaussian data found. Make sure infer_gs=True is set.")
 
@@ -77,12 +98,12 @@ if hasattr(prediction, "aux"):
         print(f"  - {key}")
 
 # ------------------------------------------------------------------------------
-# Per-image outputs: estimated camera pose, relative depth .npy/.png, and rel_depth .ply
-# Saved into the same directory as the 3D GS PLY outputs (./output_gs/gs_ply)
+# Per-image outputs: estimated camera pose and metric depth .npy/.png
+# Saved into the same directory as the 3D GS PLY outputs (./output/gs_ply)
 # ------------------------------------------------------------------------------
 
 # Directory where GS PLYs are written by export_format="gs_ply"
-gs_dir = os.path.join("./output_gs", "gs_ply")
+gs_dir = os.path.join("./output", "gs_ply")
 os.makedirs(gs_dir, exist_ok=True)
 
 
@@ -183,29 +204,24 @@ def save_rel_depth_ply(
 # Perform saves for each input image
 N = prediction.depth.shape[0]
 for idx, img_path in enumerate(images):
-    depth = prediction.depth[idx]  # [H, W], float32, relative
+    depth = prediction.depth[idx]  # [H, W], float32, metric-like (meters)
     intr = prediction.intrinsics[idx]  # [3, 3]
     ext = prediction.extrinsics[idx]  # [3, 4] w2c
     rgb = prediction.processed_images[idx] if hasattr(prediction, "processed_images") else None
 
-    # Save depth .npy (float32, relative depth)
-    depth_npy_path = os.path.join(gs_dir, f"depth_{idx:04d}.npy")
-    np.save(depth_npy_path, depth)
+    # Save metric depth .npy (float32, meters)
+    metric_npy_path = os.path.join(gs_dir, f"metric_depth_{idx:04d}.npy")
+    np.save(metric_npy_path, depth)
 
-    # Save depth.png (16-bit visualization, min-max per image)
-    depth_png_path = os.path.join(gs_dir, f"depth_{idx:04d}.png")
-    save_depth_png16(depth_png_path, depth)
+    # Save metric depth png (16-bit visualization, min-max per image)
+    metric_png_path = os.path.join(gs_dir, f"metric_depth_{idx:04d}.png")
+    save_depth_png16(metric_png_path, depth)
 
     # Save camera pose (intrinsics + w2c extrinsics) as JSON
     cam_json_path = os.path.join(gs_dir, f"cam_pose_{idx:04d}.json")
     save_cam_pose_json(cam_json_path, img_path, intr, ext)
 
-    # Save relative-depth-derived point cloud as PLY
-    rel_ply_path = os.path.join(gs_dir, f"rel_depth_{idx:04d}.ply")
-    save_rel_depth_ply(rel_ply_path, depth, intr, ext, rgb=rgb, stride=4)
-
     print(f"\nSaved per-image outputs for index {idx:04d}:")
-    print(f"  - depth (npy)  : {depth_npy_path}")
-    print(f"  - depth (png16): {depth_png_path}")
-    print(f"  - cam pose json: {cam_json_path}")
-    print(f"  - rel_depth ply: {rel_ply_path}")
+    print(f"  - metric depth (npy)  : {metric_npy_path}")
+    print(f"  - metric depth (png16): {metric_png_path}")
+    print(f"  - cam pose json       : {cam_json_path}")
