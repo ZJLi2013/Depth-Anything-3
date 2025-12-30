@@ -2,10 +2,13 @@ import os
 import json
 import argparse
 import numpy as np
-from typing import Optional, Tuple
+import random
+import glob
+from typing import Optional, Tuple, List, Dict
 from PIL import Image
 
 from depth_anything_3.api import DepthAnything3
+from depth_anything_3.utils.pose_align import align_poses_umeyama
 
 
 def extract_frame_id_from_filename(path: str) -> str:
@@ -218,6 +221,238 @@ def save_depth_png(
     Image.fromarray(img8).save(out_path)
 
 
+def parse_extrinsics_all(extrinsics_jsonl: str, cam_filter: Optional[str] = None) -> List[Dict]:
+    """
+    Parse extrinsics.jsonl and unify to c2w 4x4 per frame.
+
+    Returns a list of dicts:
+      { "frame_id": str, "E_c2w": np.ndarray (4,4), "has_Cw": bool }
+    """
+    entries: List[Dict] = []
+    with open(extrinsics_jsonl, "r", encoding="utf-8") as f:
+        for ln in f:
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                item = json.loads(ln)
+            except json.JSONDecodeError:
+                continue
+
+            if cam_filter is not None and str(item.get("cam", "")) != cam_filter:
+                continue
+
+            fstr = str(item.get("frame", "")).strip()
+            if fstr == "":
+                continue
+            fid_norm = fstr.lstrip("0") or "0"
+
+            E_3x4 = item.get("E_3x4", None)
+            R_cw = item.get("R_cw", None)
+            C_w = item.get("C_w", None)
+
+            E_c2w = None
+            has_Cw = False
+            if E_3x4 is not None:
+                M = np.array(E_3x4, dtype=np.float32)
+                if M.shape == (3, 4):
+                    E_c2w = np.eye(4, dtype=np.float32)
+                    E_c2w[:3, :3] = M[:, :3]
+                    E_c2w[:3, 3] = M[:, 3]
+            elif R_cw is not None and C_w is not None:
+                R = np.array(R_cw, dtype=np.float32)
+                C = np.array(C_w, dtype=np.float32).reshape(3)
+                if R.shape == (3, 3) and C.shape == (3,):
+                    E_c2w = np.eye(4, dtype=np.float32)
+                    E_c2w[:3, :3] = R
+                    E_c2w[:3, 3] = C
+                    has_Cw = True
+
+            if E_c2w is not None:
+                entries.append({"frame_id": fid_norm, "E_c2w": E_c2w, "has_Cw": has_Cw})
+    return entries
+
+
+def sample_random_frames(entries: List[Dict], num_frames: int, seed: int) -> List[Dict]:
+    rnd = random.Random(seed)
+    if num_frames >= len(entries):
+        return entries
+    return rnd.sample(entries, num_frames)
+
+
+def run_extrinsics_checks(
+    extrinsics_jsonl: str, cam_filter: Optional[str], num_frames: int, seed: int
+) -> None:
+    """
+    Algebraic consistency checks for c2w_to_w2c conversion:
+    - Rotation orthogonality & det=+1
+    - Inverse consistency: inv(w2c) ≈ c2w
+    - Camera center roundtrip: origin -> C_w -> origin
+    """
+    assert extrinsics_jsonl is not None, "--extrinsics-jsonl is required for --check-extrinsics"
+    entries = parse_extrinsics_all(extrinsics_jsonl, cam_filter)
+    if len(entries) == 0:
+        print("[ERROR] No valid extrinsics entries found.")
+        return
+    picked = sample_random_frames(entries, max(1, num_frames), seed)
+    print(f"[INFO] Algebra checks on {len(picked)}/{len(entries)} sampled frames")
+
+    def mat_inv(E: np.ndarray) -> np.ndarray:
+        return np.linalg.inv(E)
+
+    total = 0
+    passed = 0
+    for it in picked:
+        fid = it["frame_id"]
+        E_c2w = it["E_c2w"]
+        R_c2w = E_c2w[:3, :3]
+        t_c2w = E_c2w[:3, 3]
+
+        # Convert to w2c
+        R_wc = R_c2w.T
+        t_wc = -R_wc @ t_c2w
+        E_w2c = np.eye(4, dtype=np.float32)
+        E_w2c[:3, :3] = R_wc
+        E_w2c[:3, 3] = t_wc
+
+        # Checks
+        orth_err = float(np.linalg.norm(R_c2w.T @ R_c2w - np.eye(3)))
+        det_val = float(np.linalg.det(R_c2w))
+        inv_err = float(np.linalg.norm(mat_inv(E_w2c) - E_c2w))
+
+        # Origin roundtrip
+        origin_cam = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+        world_from_cam = (E_c2w @ origin_cam)[:3]
+        cam_from_world = (E_w2c @ np.append(world_from_cam, 1.0))[:3]
+        origin_roundtrip_err = float(np.linalg.norm(cam_from_world - origin_cam[:3]))
+
+        ok = (
+            (orth_err < 1e-3)
+            and (abs(det_val - 1.0) < 1e-3)
+            and (inv_err < 1e-5)
+            and (origin_roundtrip_err < 1e-5)
+        )
+        print(
+            f"[CHECK] frame={fid} | orth_err={orth_err:.2e} det={det_val:+.6f} inv_err={inv_err:.2e} origin_rt={origin_roundtrip_err:.2e} | {'PASS' if ok else 'FAIL'}"
+        )
+        total += 1
+        passed += int(ok)
+
+    print(f"[SUMMARY] Passed {passed}/{total} frames ({(passed/total)*100:.1f}%).")
+
+
+def get_images_map(images_dir: str, image_ext: str) -> Dict[str, str]:
+    """
+    Build map of frame_id -> image_path using extract_frame_id_from_filename.
+    """
+    paths = glob.glob(os.path.join(images_dir, f"*{image_ext}"))
+    fmap: Dict[str, str] = {}
+    for p in paths:
+        try:
+            fid = extract_frame_id_from_filename(p)
+            fmap[fid] = p
+        except Exception:
+            continue
+    return fmap
+
+
+def to_4x4(mats: np.ndarray) -> np.ndarray:
+    """
+    Ensure extrinsics are (N,4,4) by padding if (N,3,4).
+    """
+    mats = np.asarray(mats)
+    if mats.ndim != 3:
+        raise ValueError("Extrinsics must be (N,3,4) or (N,4,4)")
+    N = mats.shape[0]
+    if mats.shape[1:] == (4, 4):
+        return mats
+    if mats.shape[1:] == (3, 4):
+        out = np.eye(4, dtype=np.float32)[None].repeat(N, axis=0)
+        out[:, :3, :4] = mats
+        return out
+    raise ValueError("Unsupported extrinsics shape")
+
+
+def w2c_to_center(E: np.ndarray) -> np.ndarray:
+    """
+    Compute camera center in world coords from w2c 4x4.
+    """
+    c2w = np.linalg.inv(E)
+    return c2w[:3, 3]
+
+
+def run_scale_validation(
+    images_dir: str,
+    image_ext: str,
+    extrinsics_jsonl: str,
+    cam_filter: Optional[str],
+    num_frames: int,
+    seed: int,
+    K: np.ndarray,
+    model_path: str,
+) -> None:
+    """
+    Scale/alignment validation using random sampled frames (requires >=3).
+    - Sample frames with both extrinsics and images
+    - Run model to get predicted trajectory (intrinsics-only)
+    - Align predicted to input extrinsics via Umeyama and report scale & ATE
+    """
+    assert extrinsics_jsonl is not None, "--extrinsics-jsonl is required for --check-scale"
+    assert images_dir is not None, "--images-dir is required for --check-scale"
+    entries = parse_extrinsics_all(extrinsics_jsonl, cam_filter)
+    fmap = get_images_map(images_dir, image_ext)
+    usable = [it for it in entries if it["frame_id"] in fmap]
+
+    if len(usable) < 3:
+        print(f"[ERROR] Not enough usable frames with images. Found={len(usable)} (need >=3).")
+        return
+
+    picked = sample_random_frames(usable, max(3, num_frames), seed)
+    images = [fmap[it["frame_id"]] for it in picked]
+    ex_w2c = np.stack([it["E_c2w"] for it in picked], axis=0)
+    # Convert c2w to w2c
+    ex_w2c = np.array([np.linalg.inv(E) for E in ex_w2c], dtype=np.float32)
+
+    # Stack intrinsics
+    K_stack = np.repeat(K[None, ...], len(images), axis=0)
+
+    # Load model and run prediction (intrinsics-only)
+    model = DepthAnything3.from_pretrained(model_path)
+    model = model.to(device="cuda")
+    print(f"[INFO] Running prediction on {len(images)} frames (intrinsics-only)")
+    pred = model.inference(
+        images,
+        intrinsics=K_stack,
+        extrinsics=None,
+        align_to_input_ext_scale=False,
+        infer_gs=False,
+        export_dir=None,
+    )
+
+    pred_ext = to_4x4(pred.extrinsics)
+    # Align predicted to input via Umeyama
+    print("[INFO] Performing Umeyama Sim(3) alignment (ransac if N>=10)")
+    r, t, s, aligned_pred = align_poses_umeyama(
+        pred_ext,
+        ex_w2c,
+        ransac=len(pred_ext) >= 10,
+        return_aligned=True,
+        random_state=seed,
+    )
+
+    # Compute ATE RMSE on camera centers
+    aligned_4x4 = to_4x4(aligned_pred)
+    centers_aligned = np.stack([w2c_to_center(E) for E in aligned_4x4], axis=0)
+    centers_input = np.stack([w2c_to_center(E) for E in ex_w2c], axis=0)
+    diffs = centers_aligned - centers_input
+    rmse = float(np.sqrt(np.mean(np.sum(diffs * diffs, axis=1))))
+
+    print(f"[RESULT] scale={s:.6f} | ATE_RMSE={rmse:.6f} | frames={len(images)}")
+    print(
+        "[NOTE] Large ATE or extreme scale indicates possible coordinate/ordering/intrinsics mismatch."
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Validate DA3 depth with Hypersim intrinsics/extrinsics (single image)"
@@ -241,11 +476,31 @@ def main():
     parser.add_argument(
         "--output-dir", type=str, default="./validate_pose_out", help="Output directory"
     )
+    # MVP: sampling and validation flags
     parser.add_argument(
-        "--disable-align",
-        action="store_true",
-        help="Disable aligning prediction scale to input extrinsics (default: disabled for this validation)",
+        "--num-frames", type=int, default=3, help="Number of frames to sample for checks (>=1)"
     )
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for sampling")
+    parser.add_argument(
+        "--check-extrinsics",
+        action="store_true",
+        help="Run algebraic extrinsics checks only (no model)",
+    )
+    parser.add_argument(
+        "--check-scale",
+        action="store_true",
+        help="Run scale/alignment validation (requires >=3 frames)",
+    )
+    parser.add_argument(
+        "--images-dir",
+        type=str,
+        default=None,
+        help="Directory with images (matched by frame id) for scale check",
+    )
+    parser.add_argument(
+        "--image-ext", type=str, default=".png", help="Image file extension filter for images-dir"
+    )
+
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -270,6 +525,30 @@ def main():
             print(f"[INFO] Loaded w2c extrinsic (4x4):\n{E_w2c}")
             # Consistency check if C_w available is not here; skip
 
+    # Optional validation modes (MVP)
+    if args.check_extrinsics:
+        run_extrinsics_checks(args.extrinsics_jsonl, args.cam, args.num_frames, args.seed)
+        print("[DONE] Algebraic extrinsics checks completed.")
+        return
+
+    if args.check_scale:
+        if args.num_frames < 3:
+            raise ValueError("Scale check requires --num-frames >= 3")
+        if args.images_dir is None:
+            raise ValueError("Scale check requires --images-dir to locate images")
+        run_scale_validation(
+            args.images_dir,
+            args.image_ext,
+            args.extrinsics_jsonl,
+            args.cam,
+            args.num_frames,
+            args.seed,
+            K,
+            args.model_path,
+        )
+        print("[DONE] Scale/alignment check completed.")
+        return
+
     # Load model
     model = DepthAnything3.from_pretrained(args.model_path)
     model = model.to(device="cuda")
@@ -280,7 +559,7 @@ def main():
         [args.image],
         intrinsics=K[None],
         extrinsics=None,
-        align_to_input_ext_scale=not args.disable_align,
+        align_to_input_ext_scale=False,
         infer_gs=False,
         export_dir=None,
     )
@@ -292,12 +571,14 @@ def main():
 
     # Inference: intrinsics + extrinsics (if available)
     if E_w2c is not None:
-        print("[INFO] Running inference: intrinsics + extrinsics (w2c)")
+        print(
+            "[INFO] Running inference: extrinsics provided but single-frame; skipping alignment (intrinsics-only)"
+        )
         pred_withE = model.inference(
             [args.image],
             intrinsics=K[None],
-            extrinsics=E_w2c[None],
-            align_to_input_ext_scale=not args.disable_align,
+            extrinsics=None,
+            align_to_input_ext_scale=False,
             infer_gs=False,
             export_dir=None,
         )
