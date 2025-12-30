@@ -10,6 +10,15 @@ from PIL import Image
 from depth_anything_3.api import DepthAnything3
 from depth_anything_3.utils.pose_align import align_poses_umeyama
 
+"""
+1) Geometry-only algebra check
+python scripts/validate_pose.py --check-extrinsics --extrinsics-jsonl assets/camera/extrinsics.jsonl 
+
+2) multi-frames scale check (required >= 3 frames)
+python scripts/validate_pose.py --check-scale  --images-dir /dataset/hypersim/diffused/rgb_input/  --num-frames 8   --intrinsics-json  /dataset/hypersim/ai_001_001/_detail/cam_00/intrinsics.jsonl    --extrinsics-jsonl /dataset/hypersim/ai_001_001/_detail/cam_00/extrinsics.jsonl --output-dir /dataset/hypersim/color/c2w_validate  
+
+"""
+
 
 def extract_frame_id_from_filename(path: str) -> str:
     """
@@ -505,26 +514,6 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Extract frame id
-    frame_id = extract_frame_id_from_filename(args.image)
-    print(f"[INFO] Using image: {args.image} | frame_id={frame_id}")
-
-    # Load intrinsics (pixel-space K)
-    K = load_intrinsics_hypersim(args.intrinsics_json)
-    print(f"[INFO] Loaded intrinsics K:\n{K}")
-
-    # Load extrinsics (w2c) for this frame if provided
-    E_w2c = None
-    if args.extrinsics_jsonl:
-        E_w2c = get_w2c_for_frame(args.extrinsics_jsonl, frame_id, cam_filter=args.cam)
-        if E_w2c is None:
-            print(
-                f"[WARN] No matching extrinsic found for frame_id={frame_id}; proceeding without extrinsics."
-            )
-        else:
-            print(f"[INFO] Loaded w2c extrinsic (4x4):\n{E_w2c}")
-            # Consistency check if C_w available is not here; skip
-
     # Optional validation modes (MVP)
     if args.check_extrinsics:
         run_extrinsics_checks(args.extrinsics_jsonl, args.cam, args.num_frames, args.seed)
@@ -548,49 +537,6 @@ def main():
         )
         print("[DONE] Scale/alignment check completed.")
         return
-
-    # Load model
-    model = DepthAnything3.from_pretrained(args.model_path)
-    model = model.to(device="cuda")
-
-    # Inference: only intrinsics
-    print("[INFO] Running inference: intrinsics only")
-    pred_onlyK = model.inference(
-        [args.image],
-        intrinsics=K[None],
-        extrinsics=None,
-        align_to_input_ext_scale=False,
-        infer_gs=False,
-        export_dir=None,
-    )
-    save_depth_png(pred_onlyK.depth[0], os.path.join(args.output_dir, "depth_intrinsics_only.png"))
-    print(
-        f"[STATS] onlyK depth: min={pred_onlyK.depth[0].min():.4f} max={pred_onlyK.depth[0].max():.4f} "
-        f"p5={np.percentile(pred_onlyK.depth[0],5):.4f} p95={np.percentile(pred_onlyK.depth[0],95):.4f}"
-    )
-
-    # Inference: intrinsics + extrinsics (if available)
-    if E_w2c is not None:
-        print(
-            "[INFO] Running inference: extrinsics provided but single-frame; skipping alignment (intrinsics-only)"
-        )
-        pred_withE = model.inference(
-            [args.image],
-            intrinsics=K[None],
-            extrinsics=None,
-            align_to_input_ext_scale=False,
-            infer_gs=False,
-            export_dir=None,
-        )
-        save_depth_png(
-            pred_withE.depth[0], os.path.join(args.output_dir, "depth_with_extrinsics.png")
-        )
-        print(
-            f"[STATS] withE depth: min={pred_withE.depth[0].min():.4f} max={pred_withE.depth[0].max():.4f} "
-            f"p5={np.percentile(pred_withE.depth[0],5):.4f} p95={np.percentile(pred_withE.depth[0],95):.4f}"
-        )
-    else:
-        print("[INFO] Skipped extrinsics-based inference (no E provided).")
 
     print(f"[DONE] Outputs saved to: {args.output_dir}")
 
