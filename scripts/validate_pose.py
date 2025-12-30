@@ -12,7 +12,7 @@ from depth_anything_3.utils.pose_align import align_poses_umeyama
 
 """
 1) Geometry-only algebra check
-python scripts/validate_pose.py --check-extrinsics --extrinsics-jsonl assets/camera/extrinsics.jsonl 
+python scripts/validate_pose.py --check-extrinsics --extrinsics-jsonl /dataset/hypersim/ai_001_001/_detail/cam_00/extrinsics.jsonl
 
 2) multi-frames scale check (required >= 3 frames)
 python scripts/validate_pose.py --check-scale  --images-dir /dataset/hypersim/diffused/rgb_input/  --num-frames 8   --intrinsics-json  /dataset/hypersim/ai_001_001/_detail/cam_00/intrinsics.jsonl    --extrinsics-jsonl /dataset/hypersim/ai_001_001/_detail/cam_00/extrinsics.jsonl --output-dir /dataset/hypersim/color/c2w_validate  
@@ -466,9 +466,11 @@ def main():
     parser = argparse.ArgumentParser(
         description="Validate DA3 depth with Hypersim intrinsics/extrinsics (single image)"
     )
-    parser.add_argument("--image", type=str, required=True, help="Path to a single Hypersim image")
     parser.add_argument(
-        "--intrinsics-json", type=str, required=True, help="Path to intrinsics.json(l)"
+        "--intrinsics-json",
+        type=str,
+        default=None,
+        help="Path to intrinsics.json(l) [required for --check-scale]",
     )
     parser.add_argument(
         "--extrinsics-jsonl", type=str, default=None, help="Path to extrinsics.jsonl (optional)"
@@ -525,6 +527,10 @@ def main():
             raise ValueError("Scale check requires --num-frames >= 3")
         if args.images_dir is None:
             raise ValueError("Scale check requires --images-dir to locate images")
+        if args.intrinsics_json is None:
+            raise ValueError("Scale check requires --intrinsics-json")
+        K = load_intrinsics_hypersim(args.intrinsics_json)
+        print(f"[INFO] Loaded intrinsics K:\n{K}")
         run_scale_validation(
             args.images_dir,
             args.image_ext,
@@ -538,7 +544,8 @@ def main():
         print("[DONE] Scale/alignment check completed.")
         return
 
-    print(f"[DONE] Outputs saved to: {args.output_dir}")
+    print("[INFO] No validation mode selected. Use --check-extrinsics or --check-scale.")
+    return
 
 
 if __name__ == "__main__":
