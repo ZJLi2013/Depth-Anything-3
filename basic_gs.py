@@ -134,6 +134,40 @@ def load_intrinsics_hypersim(path: str) -> np.ndarray:
     return K
 
 
+def c2w_to_w2c(
+    R_c2w: np.ndarray, t_c2w: np.ndarray | None = None, C_w: np.ndarray | None = None
+) -> np.ndarray:
+    """
+    Convert camera-to-world (c2w) pose to world-to-camera (w2c) pose.
+
+    Args:
+        R_c2w: (3,3) rotation from camera to world
+        t_c2w: (3,) translation from camera to world (optional if C_w provided)
+        C_w:   (3,) camera center in world coordinates (optional; used if t_c2w is None)
+
+    Returns:
+        (4,4) w2c homogeneous transform [[R_wc, t_wc],[0,0,0,1]]
+        where R_wc = R_c2w^T and t_wc = -R_c2w^T * t_c2w (or -R_c2w^T * C_w)
+    """
+    R_c2w = np.asarray(R_c2w, dtype=np.float32)
+    assert R_c2w.shape == (3, 3), "R_c2w must be (3,3)"
+    R_wc = R_c2w.T
+
+    if t_c2w is not None:
+        t_c2w = np.asarray(t_c2w, dtype=np.float32).reshape(3)
+        t_wc = -R_wc @ t_c2w
+    elif C_w is not None:
+        C_w = np.asarray(C_w, dtype=np.float32).reshape(3)
+        t_wc = -R_wc @ C_w
+    else:
+        raise ValueError("c2w_to_w2c requires either t_c2w or C_w")
+
+    E4 = np.eye(4, dtype=np.float32)
+    E4[:3, :3] = R_wc
+    E4[:3, 3] = t_wc
+    return E4
+
+
 def load_extrinsics_hypersim_jsonl(
     path: str, cam_filter: Optional[str] = None
 ) -> Dict[str, np.ndarray]:
@@ -168,25 +202,23 @@ def load_extrinsics_hypersim_jsonl(
 
             E_3x4 = item.get("E_3x4", None)
             if E_3x4 is not None:
-                E = np.array(E_3x4, dtype=np.float32)
-                if E.shape == (3, 4):
-                    # Build 4x4
-                    E4 = np.eye(4, dtype=np.float32)
-                    E4[:3, :4] = E
+                # Treat Hypersim E_3x4 as c2w and convert to w2c
+                E_c2w = np.array(E_3x4, dtype=np.float32)
+                if E_c2w.shape == (3, 4):
+                    R_c2w = E_c2w[:, :3]
+                    t_c2w = E_c2w[:, 3]
+                    E4 = c2w_to_w2c(R_c2w, t_c2w=t_c2w)
                     mapping[fid] = E4
                     continue
 
-            # Fallback: build from R_cw and C_w
-            R_cw = np.array(item.get("R_cw", []), dtype=np.float32)
+            # Fallback: treat provided rotation/center as c2w and convert to w2c
+            R_c2w = np.array(item.get("R_cw", []), dtype=np.float32)
             C_w = np.array(item.get("C_w", []), dtype=np.float32)
-            if R_cw.shape != (3, 3) or C_w.shape != (3,):
+            if R_c2w.shape != (3, 3) or C_w.shape != (3,):
                 # Skip if insufficient data
                 continue
 
-            t_w2c = -R_cw @ C_w  # world->camera translation
-            E4 = np.eye(4, dtype=np.float32)
-            E4[:3, :3] = R_cw
-            E4[:3, 3] = t_w2c
+            E4 = c2w_to_w2c(R_c2w, C_w=C_w)
             mapping[fid] = E4
 
     if len(mapping) == 0:
@@ -443,11 +475,6 @@ def main():
 
     # Align scale flag
     align_flag = True
-    if args.no_align_to_input_ext_scale:
-        align_flag = False
-    elif args.align_to_input_ext_scale:
-        align_flag = True
-
     # Run inference with GS head enabled
     prediction = model.inference(
         images,
