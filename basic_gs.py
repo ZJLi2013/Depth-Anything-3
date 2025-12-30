@@ -246,7 +246,14 @@ def main():
         action="store_true",
         help="Disable aligning prediction scale to input extrinsics",
     )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="./output_gs",
+        help="Directory to save GS outputs (default: ./output_gs)",
+    )
     args = parser.parse_args()
+    os.makedirs(args.output_dir, exist_ok=True)
 
     device = torch.device("cuda")
 
@@ -309,7 +316,7 @@ def main():
         intrinsics=intrinsics_arr,
         align_to_input_ext_scale=align_flag,
         infer_gs=True,  # Enable Gaussian Splatting branch
-        export_dir="./output_gs",  # Directory to save GS outputs
+        export_dir=args.output_dir,  # Directory to save GS outputs
         export_format="gs_ply",  # Export GS format (can also use "gs_ply-gs_video" for both)
     )
 
