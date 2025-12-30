@@ -48,16 +48,39 @@ def load_intrinsics_hypersim(path: str) -> np.ndarray:
     """
     # Read JSON or the first non-empty JSON line if JSONL
     if path.lower().endswith(".jsonl"):
+        # Robust handling:
+        # 1) Try parsing the entire file content as a single JSON object (multi-line JSON)
+        # 2) Fallback to line-by-line JSONL: first non-empty, non-comment line via json.loads
+        #    and as a last resort, ast.literal_eval to tolerate single quotes (Python-literal style)
         with open(path, "r", encoding="utf-8") as f:
-            line = None
-            for ln in f:
-                ln = ln.strip()
-                if ln:
-                    line = ln
-                    break
-            if line is None:
-                raise ValueError(f"No JSONL lines found in {path}")
-            data = json.loads(line)
+            text = f.read()
+        text_stripped = text.strip()
+        data = None
+        try:
+            # Supports multi-line JSON object files
+            data = json.loads(text_stripped)
+        except Exception:
+            # Fallback: treat as JSONL (one JSON object per line)
+            with open(path, "r", encoding="utf-8") as f:
+                for ln in f:
+                    ln = ln.strip()
+                    if not ln or ln.startswith("#") or ln.startswith("//"):
+                        continue
+                    try:
+                        data = json.loads(ln)
+                        break
+                    except Exception:
+                        try:
+                            import ast
+
+                            data = ast.literal_eval(ln)
+                            break
+                        except Exception:
+                            continue
+        if data is None:
+            raise ValueError(
+                f"Failed to parse intrinsics from {path}: ensure valid JSON or JSONL format."
+            )
     else:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
