@@ -236,8 +236,7 @@ def debug_check_frame_mapping(
     images: List[str], ext_mapping: Dict[str, np.ndarray], sample_n: int = 10
 ) -> None:
     """
-    Debug helper: check if image-derived frame_ids match extrinsics mapping keys.
-    Prints sample mappings and unmatched items.
+    Debug helper: only print unmatched items between image-derived frame_ids and extrinsics keys.
     """
     # Collect image frame ids
     image_fids: List[str] = []
@@ -252,16 +251,6 @@ def debug_check_frame_mapping(
     ext_fids = set(ext_mapping.keys())
     img_fids_set = set(image_fids)
 
-    # Print sample mappings
-    print("\n[DEBUG] image basename → frame_id samples:")
-    for img in images[:sample_n]:
-        try:
-            fid = extract_frame_id_from_filename(img)
-            hit = "(hit)" if fid in ext_fids else "(MISS)"
-            print(f"  {os.path.basename(img)} → {fid} {hit}")
-        except Exception as e:
-            print(f"  {os.path.basename(img)} → [ERROR: {e}]")
-
     # Images with no matching extrinsics
     unmatched_images = [
         img for img in images if extract_frame_id_from_filename(img) not in ext_fids
@@ -272,6 +261,8 @@ def debug_check_frame_mapping(
             print(f"  - {name}")
         if len(unmatched_images) > sample_n:
             print(f"  ... and {len(unmatched_images) - sample_n} more")
+    else:
+        print("[INFO] All images matched extrinsics frame_ids.")
 
     # Extrinsics that are not used by any image
     unused_ext_fids = [fid for fid in ext_fids if fid not in img_fids_set]
@@ -281,6 +272,65 @@ def debug_check_frame_mapping(
             print(f"  - {fid}")
         if len(unused_ext_fids) > sample_n:
             print(f"  ... and {len(unused_ext_fids) - sample_n} more")
+    else:
+        print("[INFO] No unused extrinsics frame_ids.")
+
+
+def filter_images_and_extrinsics(
+    images: List[str], ext_map: Dict[str, np.ndarray], sample_n: int = 10
+) -> Tuple[List[str], Dict[str, np.ndarray], List[str], List[str]]:
+    """
+    Filter to the strict intersection of image frames and extrinsics frames.
+    Returns:
+        matched_images: images whose frame_id exists in ext_map
+        filtered_ext_map: ext_map filtered to only used frame_ids
+        dropped_images: images without a matching extrinsics frame_id
+        dropped_ext_fids: extrinsics frame_ids not used by any image
+    """
+    matched_images: List[str] = []
+    matched_fids: List[str] = []
+    dropped_images: List[str] = []
+
+    for img in images:
+        try:
+            fid = extract_frame_id_from_filename(img)
+        except Exception:
+            dropped_images.append(img)
+            continue
+        if fid in ext_map:
+            matched_images.append(img)
+            matched_fids.append(fid)
+        else:
+            dropped_images.append(img)
+
+    matched_set = set(matched_fids)
+    filtered_ext_map: Dict[str, np.ndarray] = {fid: ext_map[fid] for fid in matched_set}
+    dropped_ext_fids: List[str] = [fid for fid in ext_map.keys() if fid not in matched_set]
+
+    # Summary
+    print(
+        f"[INFO] Images total={len(images)}, matched={len(matched_images)}, dropped={len(dropped_images)}"
+    )
+    if dropped_images:
+        print(f"[WARN] Dropped {len(dropped_images)} unmatched images (showing up to {sample_n}):")
+        for name in [os.path.basename(p) for p in dropped_images[:sample_n]]:
+            print(f"  - {name}")
+        if len(dropped_images) > sample_n:
+            print(f"  ... and {len(dropped_images) - sample_n} more")
+
+    print(
+        f"[INFO] Extrinsics total={len(ext_map)}, used={len(filtered_ext_map)}, dropped={len(dropped_ext_fids)}"
+    )
+    if dropped_ext_fids:
+        print(
+            f"[WARN] Dropped {len(dropped_ext_fids)} unused extrinsics frame_ids (up to {sample_n}):"
+        )
+        for fid in dropped_ext_fids[:sample_n]:
+            print(f"  - {fid}")
+        if len(dropped_ext_fids) > sample_n:
+            print(f"  ... and {len(dropped_ext_fids) - sample_n} more")
+
+    return matched_images, filtered_ext_map, dropped_images, dropped_ext_fids
 
 
 def main():
@@ -367,11 +417,18 @@ def main():
     extrinsics_arr: Optional[np.ndarray] = None
     if args.extrinsics_jsonl is not None:
         ext_map = load_extrinsics_hypersim_jsonl(args.extrinsics_jsonl, cam_filter=args.cam)
-        # Debug check: verify image frame_ids match extrinsics keys
+        # Only print unmatches
         debug_check_frame_mapping(images, ext_map)
-        extrinsics_arr = build_extrinsics_array_for_images(
-            images, ext_map, strict=args.strict_match
+        # Strict intersection: keep only frames that appear in both images and extrinsics
+        matched_images, filtered_ext_map, dropped_images, dropped_ext_fids = (
+            filter_images_and_extrinsics(images, ext_map)
         )
+        images = matched_images
+        # Re-broadcast intrinsics after filtering (if provided)
+        if args.intrinsics_json is not None:
+            intrinsics_arr = broadcast_intrinsics(K, len(images))
+        # Build extrinsics for filtered images (strict)
+        extrinsics_arr = build_extrinsics_array_for_images(images, filtered_ext_map, strict=True)
         print(f"Loaded {extrinsics_arr.shape[0]} per-frame extrinsics from JSONL.")
     else:
         print("No extrinsics JSONL provided; proceeding without E (model will estimate poses).")
