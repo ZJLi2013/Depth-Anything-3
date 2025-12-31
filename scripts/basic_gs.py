@@ -411,9 +411,15 @@ def main():
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="./output_gs",
-        help="Directory to save GS outputs (default: ./output_gs)",
+        default="./output",
+        help="Directory to save GS outputs (default: ./output)",
     )
+    parser.add_argument(
+        "--gs-head",
+        action="store_true",
+        help="enable GS head",
+    )
+
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -473,18 +479,25 @@ def main():
         )
         return
 
-    # Align scale flag
-    align_flag = True
-    # Run inference with GS head enabled
-    prediction = model.inference(
-        images,
-        extrinsics=extrinsics_arr,
-        intrinsics=intrinsics_arr,
-        align_to_input_ext_scale=align_flag,
-        infer_gs=True,  # Enable Gaussian Splatting branch
-        export_dir=args.output_dir,  # Directory to save GS outputs
-        export_format="gs_ply",  # Export GS format (can also use "gs_ply-gs_video" for both)
-    )
+    if args.gs_head:
+        # Run inference with GS head enabled
+        prediction = model.inference(
+            images,
+            extrinsics=extrinsics_arr,
+            intrinsics=intrinsics_arr,
+            infer_gs=True,  # Enable Gaussian Splatting branch
+            export_dir=args.output_dir,  # Directory to save GS outputs
+            export_format="gs_ply",  # Export GS format (can also use "gs_ply-gs_video" for both)
+        )
+    else:
+        prediction = model.inference(
+            images,
+            extrinsics=extrinsics_arr,
+            intrinsics=intrinsics_arr,
+            infer_gs=False,
+            export_dir=args.output_dir,
+            export_format="ply",
+        )
 
     # Standard outputs
     # prediction.processed_images : [N, H, W, 3] uint8 array
@@ -505,7 +518,7 @@ def main():
         try:
             print("GS means shape:", prediction.gaussians.means.shape)
         except Exception:
-            pass
+            print("\nGaussian Splatting data available in prediction.gaussians")
     else:
         print("\nWarning: No Gaussian data found. Make sure infer_gs=True is set.")
 

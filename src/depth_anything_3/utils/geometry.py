@@ -72,6 +72,9 @@ def transpose_last_two_axes(arr):
 
 
 def affine_inverse_np(A: np.ndarray):
+    """
+    批量计算  4x4 齐次刚体变换矩阵的逆，即 c2w <-> w2c
+    """
     R = A[..., :3, :3]
     T = A[..., :3, 3:]
     P = A[..., 3:, :]

@@ -127,7 +127,13 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         with torch.no_grad():
             with torch.autocast(device_type=image.device.type, dtype=autocast_dtype):
                 return self.model(
-                    image, extrinsics, intrinsics, export_feat_layers, infer_gs, use_ray_pose, ref_view_strategy
+                    image,
+                    extrinsics,
+                    intrinsics,
+                    export_feat_layers,
+                    infer_gs,
+                    use_ray_pose,
+                    ref_view_strategy,
                 )
 
     def inference(
@@ -202,6 +208,9 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
 
         # Normalize extrinsics
         ex_t_norm = self._normalize_extrinsics(ex_t.clone() if ex_t is not None else None)
+        """
+        ex_t_norm 是以 1st frame 外参为世界坐标系，并进行了尺度归一化的 所有帧的 w2c 外参(相机位姿)序列
+        """
 
         # Run model forward pass
         export_feat_layers = list(export_feat_layers) if export_feat_layers is not None else []
@@ -212,6 +221,12 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
 
         # Convert raw output to prediction
         prediction = self._convert_to_prediction(raw_output)
+        """
+        上述 run_model_forward() 输入的 ex_t_norm 是 w2c 格式的，所以应该这里 prediction 中extrinsics 等应该也是 w2c 格式的
+        TODO, 如此分析：
+            1. 如果align_to_input_ext_scale=False, da-3模型输出的 prediction.extrinsics 应该是 w2c 格式的?
+            2. 如果aligN_to_input_ext_scale=True， da-3 模型输出的 prediction.extrinsics 又是 c2w 格式的 ?
+        """
 
         # Align prediction to extrinsincs
         prediction = self._align_to_input_extrinsics_intrinsics(
@@ -325,18 +340,35 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         return imgs, ex_t, in_t
 
     def _normalize_extrinsics(self, ex_t: torch.Tensor | None) -> torch.Tensor | None:
-        """Normalize extrinsics"""
+        """Normalize extrinsics
+        ex_t [N, 4, 4]
+        """
         if ex_t is None:
             return None
         transform = affine_inverse(ex_t[:, :1])
+        """
+            输入image list 中 1st frame w2c 格式的外参矩阵 # TODO: 待确认，所以默认输入外参是 w2c 格式的?
+            affine_inverse(w2c_ext) = c2w_ext 得到 c2w 格式的外参矩阵，或者说是 1st frame 在 世界系下的坐标
+        """
         ex_t_norm = ex_t @ transform
+        """
+            所有相机外参(w2c格式) 右乘 1st_frame_c2w ，即将所有帧的外参对齐到以 1st-frame 位姿为原点的世界坐标下 。此后 1st 帧外参变成 I ，而其余帧外参都是相对 1st frame 的表示
+            # TODO: w2c格式的相机外参 能与 c2w 的transform 做乘法 ?
+        """
         c2ws = affine_inverse(ex_t_norm)
-        translations = c2ws[..., :3, 3]
-        dists = translations.norm(dim=-1)
-        median_dist = torch.median(dists)
-        median_dist = torch.clamp(median_dist, min=1e-1)
-        ex_t_norm[..., :3, 3] = ex_t_norm[..., :3, 3] / median_dist
-        return ex_t_norm
+        """
+            获取所有frames 的 c2w 格式的相机外参，即世界坐标下per frame 的相机位姿
+        """
+        translations = c2ws[..., :3, 3]  # 取所有 frames 的 平移向量
+        dists = translations.norm(
+            dim=-1
+        )  # 对 [x, y, z] 求 L2 范数，即 所有帧 到世界坐标原点的欧氏距离
+        median_dist = torch.median(dists)  # 取距离中位数，作为轨迹的 典型尺度
+        median_dist = torch.clamp(median_dist, min=1e-1)  # 防止过小，加 0.1 下限
+        ex_t_norm[..., :3, 3] = (
+            ex_t_norm[..., :3, 3] / median_dist
+        )  # 对所有帧 w2c 的平移项进行尺度归一化，即把所有相机位姿做一个全局的相似缩放变换，只影响平移
+        return ex_t_norm  # 返回以 1st frame 外参为世界坐标系，并进行了尺度归一化的 所有帧的 w2c 外参序列
 
     def _align_to_input_extrinsics_intrinsics(
         self,
@@ -357,6 +389,19 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
             return_aligned=True,
             random_state=42,
         )
+        """
+            1. 注意，这里传参是把 pred.extrinsics(w2c) 作为 ref，而输入的 extrinsics(w2c) 作为 estimate 
+            此时 scale 的含义是" 输入外参的轨迹坐标系缩放到预测轨迹坐标系" scale = s_pred / s_input 
+            * 通俗解释: 把pred/input 空间都想象成一把尺子，那么 pred 尺子上的一个刻度 = input 尺子上的 scale 个刻度
+            下文中当使用 align_to_input_ext_scale 时 
+                * pred.depth /= scale，=》 pred.depth *= s_input / s_pred 
+                * pred.extrinsics = extrinsics 
+            * 通俗解释: da-3 输出 pred.depth 是在 pred 尺子上度量的深度值，而要映射回 input尺子上的深度度量，就需要 /=scale            
+            参考: https://github.com/ByteDance-Seed/Depth-Anything-3/issues/138
+
+            2. 注意，align_poses_umeyama() 输出的是 scale 是 c2w 格式的，理解就是 ref.poses(c2w) 与 est.poses(c2w) 两个坐标系的映射
+
+        """
         if align_to_input_ext_scale:
             prediction.extrinsics = extrinsics[..., :3, :].numpy()
             prediction.depth /= scale
@@ -381,7 +426,9 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
             torch.cuda.synchronize(device)
         start_time = time.time()
         feat_layers = list(export_feat_layers) if export_feat_layers is not None else None
-        output = self.forward(imgs, ex_t, in_t, feat_layers, infer_gs, use_ray_pose, ref_view_strategy)
+        output = self.forward(
+            imgs, ex_t, in_t, feat_layers, infer_gs, use_ray_pose, ref_view_strategy
+        )
         if need_sync:
             torch.cuda.synchronize(device)
         end_time = time.time()
