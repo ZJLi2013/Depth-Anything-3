@@ -335,6 +335,25 @@ def filter_images_and_extrinsics(
         else:
             dropped_images.append(img)
 
+    # Sort matched results by numeric frame id (ascending) and print first few
+    try:
+        pairs = [(int(fid), fid, img) for fid, img in zip(matched_fids, matched_images)]
+    except ValueError:
+        # Fallback: robust int conversion using regex when fid contains non-numeric parts
+        def to_int_safe(fid_str: str) -> int:
+            nums = re.findall(r"\d+", fid_str)
+            return int(nums[-1]) if nums else 0
+
+        pairs = [(to_int_safe(fid), fid, img) for fid, img in zip(matched_fids, matched_images)]
+    pairs.sort(key=lambda x: x[0])
+
+    matched_fids = [fid for _, fid, _ in pairs]
+    matched_images = [img for _, _, img in pairs]
+
+    print("[INFO] Matched images sorted by frame id (numeric ascending):")
+    for i, (_, fid, img) in enumerate(pairs[:sample_n]):
+        print(f"  [{i:02d}] fid={fid} name={os.path.basename(img)}")
+
     matched_set = set(matched_fids)
     filtered_ext_map: Dict[str, np.ndarray] = {fid: ext_map[fid] for fid in matched_set}
     dropped_ext_fids: List[str] = [fid for fid in ext_map.keys() if fid not in matched_set]
@@ -496,7 +515,7 @@ def main():
             intrinsics=intrinsics_arr,
             infer_gs=False,
             export_dir=args.output_dir,
-            export_format="ply",
+            export_format="glb",
         )
 
     # Standard outputs
@@ -518,7 +537,7 @@ def main():
         try:
             print("GS means shape:", prediction.gaussians.means.shape)
         except Exception:
-            print("\nGaussian Splatting data available in prediction.gaussians")
+            pass
     else:
         print("\nWarning: No Gaussian data found. Make sure infer_gs=True is set.")
 
