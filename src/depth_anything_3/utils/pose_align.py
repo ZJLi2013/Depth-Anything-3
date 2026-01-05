@@ -74,9 +74,14 @@ def _to44(ext):
 
 
 def _poses_from_ext(ext_ref, ext_est):
+    """
+    输入 ext_ref, ext_est 应该是  w2c
+    通过 affine_inverse_np() 计算 4x4 变换矩阵的逆，即得到 c2w
+    输出 pose_ref/est 应该是 c2w
+    """
     ext_ref = _to44(ext_ref)
     ext_est = _to44(ext_est)
-    pose_ref = affine_inverse_np(ext_ref)
+    pose_ref = affine_inverse_np(ext_ref)  #
     pose_est = affine_inverse_np(ext_est)
     return pose_ref, pose_est
 
@@ -111,6 +116,10 @@ def _median_nn_thresh(pose_ref, pose_est_aligned):
 def _ransac_align_sim3(
     pose_ref, pose_est, sub_n=None, inlier_thresh=None, max_iters=10, random_state=None
 ):
+    """
+    输入:  pose_ref, pose_est 为 c2w 下ref(da-3输出)，est(输入外参)位姿
+    使用 sim3 估计一个稳健的 sim(3) 变换 (R, t, s) 使得 est轨迹 对齐到 ref 轨迹，对异常帧/outliers 不敏感
+    """
     rng = np.random.default_rng(random_state)
     N = pose_ref.shape[0]
     idx_all = np.arange(N)
@@ -121,24 +130,32 @@ def _ransac_align_sim3(
 
     # Pre-alignment + default threshold
     r0, t0, s0, pose_est0 = _umeyama_sim3_from_paths(pose_ref, pose_est)
+    """
+        用全量轨迹(pose_ref, pose_est) 做一次 umeyama 赌气，得到一个 pre-align 模型 (r0, t0, s0)
+        pose_est0 是吧 pose_est 使用该 sim3 对齐后的位姿序列(c2w)
+    """
     if inlier_thresh is None:
         inlier_thresh = _median_nn_thresh(pose_ref, pose_est0)
 
-    P_ref_all = pose_ref[:, :3, 3]
+    P_ref_all = pose_ref[:, :3, 3]  # ref 估计的相机中心(平移坐标)
 
-    best_model = (r0, t0, s0)
+    best_model = (r0, t0, s0)  # best_model 初始化
     best_inliers = None
     best_score = (-1, np.inf)  # (num_inliers, mean_err)
 
     for _ in range(max_iters):
-        sample = rng.choice(idx_all, size=sub_n, replace=False)
+        sample = rng.choice(idx_all, size=sub_n, replace=False)  # 随机采样 sub_n 帧
         try:
-            r, t, s, _ = _umeyama_sim3_from_paths(pose_ref[sample], pose_est[sample])
+            r, t, s, _ = _umeyama_sim3_from_paths(
+                pose_ref[sample], pose_est[sample]
+            )  # 在 sub-n 上做 umeyama 对齐 est -> ref
         except Exception:
             continue
-        pose_h = _apply_sim3_to_poses(pose_est, r, t, s)
-        P_h = pose_h[:, :3, 3]
-        errs = np.linalg.norm(P_h - P_ref_all, axis=1)  # Match by same index
+        pose_h = _apply_sim3_to_poses(
+            pose_est, r, t, s
+        )  # 使用候选 (r, t, s) 对全量 pose_est 做对齐变换
+        P_h = pose_h[:, :3, 3]  # 提取对齐后的 估计相机中心序列
+        errs = np.linalg.norm(P_h - P_ref_all, axis=1)  # Match by same index // 计算 l2 范数
         inliers = errs <= inlier_thresh
         k = int(inliers.sum())
         mean_err = float(errs[inliers].mean()) if k > 0 else np.inf
@@ -146,6 +163,11 @@ def _ransac_align_sim3(
             best_score = (k, mean_err)
             best_model = (r, t, s)
             best_inliers = inliers
+        """
+            计算误差与内点:
+            1. errs 逐帧同索引配对的欧式距离
+            2. 先比较 k 内点数，若持平，再比较 mean_err，基类 best_model, best_inliers
+        """
 
     # Fit again with best inliers
     if best_inliers is not None and best_inliers.sum() >= 3:
@@ -173,7 +195,9 @@ def align_poses_umeyama(
       nearest reference pose after pre-alignment"
     Returns rotation (3x3), translation (3,), scale; optionally returns aligned extrinsics (4x4).
     """
-    pose_ref, pose_est = _poses_from_ext(ext_ref, ext_est)
+    pose_ref, pose_est = _poses_from_ext(
+        ext_ref, ext_est
+    )  # pose_ref/est 理解是 世界坐标下的 相机位姿(c2w)
 
     if not ransac:
         r, t, s, pose_est_aligned = _umeyama_sim3_from_paths(pose_ref, pose_est)
@@ -187,41 +211,19 @@ def align_poses_umeyama(
             random_state=random_state,
         )
         pose_est_aligned = _apply_sim3_to_poses(pose_est, r, t, s)
+        """
+            * sim3(r, t, s) 为  da-3 模型输入 pose_est  向 da-3 输出pose_ref 对齐的 sim3 , c2w下
+            * 这里是将 pose_est(即输入外参) 对齐到 da-3 输出的，以 1st frame 为世界坐标系
+        """
 
     if return_aligned:
-        ext_est_aligned = affine_inverse_np(pose_est_aligned)
+        ext_est_aligned = affine_inverse_np(pose_est_aligned)  # c2w 变换到 w2c
         return r, t, s, ext_est_aligned
+    """
+        return_aligned = False, api.py 中默认False
+        即最终返回的 sim3(r, t, s) 是 c2w 下
+    """
     return r, t, s
-
-
-# def align_poses_umeyama(ext_ref: np.ndarray, ext_est: np.ndarray, return_aligned=False):
-#     """
-#     Align estimated trajectory to reference trajectory using Umeyama Sim(3)
-#     alignment (via evo PosePath3D). # noqa
-#     Returns rotation, translation, and scale.
-#     """
-#     # If input extrinsics are 3x4, convert to 4x4 by padding
-#     if ext_ref.shape[1] == 3:
-#         ext_ref_ = np.eye(4)[None].repeat(len(ext_ref), 0)
-#         ext_ref_[:, :3] = ext_ref
-#         ext_ref = ext_ref_
-#     if ext_est.shape[1] == 3:
-#         ext_est_ = np.eye(4)[None].repeat(len(ext_est), 0)
-#         ext_est_[:, :3] = ext_est
-#         ext_est = ext_est_
-
-#     # Convert to camera poses (inverse extrinsics)
-#     pose_ref = affine_inverse_np(ext_ref)
-#     pose_est = affine_inverse_np(ext_est)
-
-#     # Create evo PosePath3D objects
-#     path_ref = PosePath3D(poses_se3=pose_ref)
-#     path_est = PosePath3D(poses_se3=pose_est)
-#     r, t, s = path_est.align(path_ref, correct_scale=True)
-#     if return_aligned:
-#         return r, t, s, affine_inverse_np(np.stack(path_est.poses_se3))
-#     else:
-#         return r, t, s
 
 
 def apply_umeyama_alignment_to_ext(

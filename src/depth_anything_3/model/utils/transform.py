@@ -200,7 +200,11 @@ def cam_quat_xyzw_to_world_quat_wxyz(cam_quat_xyzw, c2w):
     rotmat_cam = quat_to_mat(cam_quat_wxyz_flat).reshape(b, n, 3, 3)
     # 3. Transform to world space
     rotmat_c2w = c2w[..., :3, :3]
-    rotmat_world = torch.matmul(rotmat_c2w, rotmat_cam)
+    # Original batched matmul (commented out for ROCm/HIP compatibility)
+    # rotmat_world = torch.matmul(rotmat_c2w, rotmat_cam)
+    # ROCm/HIP compatible: elementwise + reduction to compute A @ B without HIPBLAS batched GEMM
+    # rotmat_world[i,j] = sum_k rotmat_c2w[i,k] * rotmat_cam[k,j]
+    rotmat_world = (rotmat_c2w.unsqueeze(-1) * rotmat_cam.unsqueeze(-3)).sum(dim=-2)
     # 4. Matrix to quaternion (wxyz)
     rotmat_world_flat = rotmat_world.reshape(-1, 3, 3)
     world_quat_wxyz_flat = mat_to_quat(rotmat_world_flat)
