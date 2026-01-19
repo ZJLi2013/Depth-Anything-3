@@ -211,9 +211,11 @@ def render_novel_view_orbit_path(
     centers = c2w[:, :3, 3]
     ups = normalize(c2w[:, :3, 1])
 
+
     pivot = torch.median(centers, dim=0).values
     dist_med = torch.median((centers - pivot).norm(dim=-1))
     radius = dist_med.clamp(min=1e-4)
+
 
     up_axis = normalize(ups.mean(dim=0))
     if up_axis.norm() < 1e-6:
