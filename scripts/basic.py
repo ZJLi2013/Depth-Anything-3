@@ -44,18 +44,10 @@ def main() -> None:
         help="Path to DA3 model directory (default: /dataset/DA3NESTED-GIANT-LARGE)",
     )
     parser.add_argument(
-        "--gs-head",
-        action="store_true",
-        help="Enable Gaussian Splatting branch (infer_gs=True)",
-    )
-    parser.add_argument(
         "--export-format",
         type=str,
         default=None,
-        help=(
-            "Export format string passed to DA3 (e.g. glb, gs_views, glb-gs_views). "
-            "If omitted: glb when --gs-head is off, otherwise gs_views."
-        ),
+        help=("Export format string passed to DA3 (e.g. glb, gs_views). " "If omitted: glb."),
     )
     parser.add_argument(
         "--cam-trace",
@@ -97,7 +89,8 @@ def main() -> None:
 
     export_format = args.export_format
     if export_format is None:
-        export_format = "gs_views" if args.gs_head else "glb"
+        export_format = "glb"
+    infer_gs = "gs" in export_format
 
     model = DepthAnything3.from_pretrained(args.model_dir)
     model = model.to(device=device)
@@ -106,7 +99,7 @@ def main() -> None:
         images,
         extrinsics=None,
         intrinsics=None,
-        infer_gs=args.gs_head,
+        infer_gs=infer_gs,
         export_dir=args.output_dir,
         export_format=export_format,
     )
@@ -123,17 +116,35 @@ def main() -> None:
     if prediction.intrinsics is not None:
         print("Intrinsics shape:", prediction.intrinsics.shape)
 
+    H = W = None
+    if args.cam_trace or args.novel_orbit:
+        if prediction.processed_images is not None:
+            H, W = prediction.processed_images.shape[1:3]
+        elif prediction.depth is not None:
+            H, W = prediction.depth.shape[-2:]
+
+    # Optional camera trace visualization
+    if args.cam_trace:
+        if prediction.extrinsics is None or prediction.intrinsics is None:
+            print("[WARN] Skip camera trace: prediction.extrinsics/intrinsics not available.")
+            return
+
+        cam_trace_visualization(
+            export_dir=args.output_dir,
+            extrinsics_w2c=prediction.extrinsics,  # (N,3,4) or (N,4,4)
+            intrinsics=prediction.intrinsics,  # (N,3,3) or (3,3)
+            image_sizes=(H, W),
+            output_name="camera_trace.glb",
+        )
+        print(
+            f"[INFO] Saved camera trajectory visualization to: {os.path.join(args.output_dir, 'camera_trace.glb')}"
+        )
+
     # generate novel view poses (export novel-view camera poses)
     if args.novel_orbit:
         if prediction.extrinsics is None or prediction.intrinsics is None:
             print("[WARN] Skip novel orbit: prediction.extrinsics/intrinsics not available.")
         else:
-            # Use processed image size if available; fallback to depth size
-            if prediction.processed_images is not None:
-                H, W = prediction.processed_images.shape[1:3]
-            else:
-                H, W = prediction.depth.shape[-2:]
-
             # render_novel_view_orbit_path expects torch tensors
             ex_w2c = torch.from_numpy(prediction.extrinsics).to(device)
             in_k = torch.from_numpy(prediction.intrinsics).to(device)
@@ -161,30 +172,6 @@ def main() -> None:
                 output_name=os.path.basename(out_glb),
             )
             print(f"[INFO] Saved novel orbit trace glb to: {out_glb}")
-
-    # Optional camera trace visualization
-    if args.cam_trace:
-        if prediction.extrinsics is None or prediction.intrinsics is None:
-            print("[WARN] Skip camera trace: prediction.extrinsics/intrinsics not available.")
-            return
-
-        if prediction.processed_images is not None:
-            H, W = prediction.processed_images.shape[1:3]
-        else:
-            H, W = prediction.depth.shape[-2:]
-
-        cam_trace_visualization(
-            export_dir=args.output_dir,
-            extrinsics_w2c=prediction.extrinsics,  # (N,3,4) or (N,4,4)
-            intrinsics=prediction.intrinsics,  # (N,3,3) or (3,3)
-            image_sizes=(H, W),
-            output_name="camera_trace.glb",
-        )
-        print(
-            f"[INFO] Saved camera trajectory visualization to: {os.path.join(args.output_dir, 'camera_trace.glb')}"
-        )
-
-    # generate novel view orbit cam path
 
 
 if __name__ == "__main__":
