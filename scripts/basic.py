@@ -111,8 +111,32 @@ def main() -> None:
             raise KeyError(
                 f"Trace NPZ must contain keys 'extrinsics_w2c' and 'intrinsics', got: {list(trace_npz.keys())}"
             )
-        render_exts = trace_npz["extrinsics_w2c"]
-        render_ixts = trace_npz["intrinsics"]
+        render_exts_np = trace_npz["extrinsics_w2c"]
+        render_ixts_np = trace_npz["intrinsics"]
+
+        # Convert to torch tensors for renderer (affine_inverse is torchscript -> Tensor only)
+        render_exts = torch.as_tensor(render_exts_np, dtype=torch.float32, device=device)
+        render_ixts = torch.as_tensor(render_ixts_np, dtype=torch.float32, device=device)
+
+        # Normalize shapes to (B, V, ...)
+        # extrinsics: (V,4,4)/(V,3,4) or (B,V,*,*)
+        if render_exts.ndim == 3:
+            render_exts = render_exts.unsqueeze(0)
+        elif render_exts.ndim != 4:
+            raise ValueError(
+                f"extrinsics_w2c must be (V,4,4)/(V,3,4) or (B,V,*,*), got {tuple(render_exts.shape)}"
+            )
+
+        # intrinsics: (3,3)/(V,3,3) or (B,V,3,3)
+        if render_ixts.ndim == 2:
+            render_ixts = render_ixts.unsqueeze(0).unsqueeze(0)  # (1,1,3,3)
+            render_ixts = render_ixts.expand(render_exts.shape[0], render_exts.shape[1], 3, 3)
+        elif render_ixts.ndim == 3:
+            render_ixts = render_ixts.unsqueeze(0)
+        elif render_ixts.ndim != 4:
+            raise ValueError(
+                f"intrinsics must be (3,3)/(V,3,3) or (B,V,3,3), got {tuple(render_ixts.shape)}"
+            )
 
     model = DepthAnything3.from_pretrained(args.model_dir)
     model = model.to(device=device)
