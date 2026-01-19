@@ -16,6 +16,7 @@ import os
 from typing import Literal, Optional
 import moviepy.editor as mpy
 import torch
+from PIL import Image
 
 from depth_anything_3.model.utils.gs_renderer import run_renderer_in_chunk_w_trj_mode
 from depth_anything_3.specs import Prediction
@@ -76,7 +77,7 @@ def export_to_gs_video(
         "wobble_inter",
     ] = "extend",
     color_mode: Literal["RGB+D", "RGB+ED"] = "RGB+ED",
-    vis_depth: Optional[Literal["hcat", "vcat"]] = "hcat",
+    vis_depth: Optional[Literal["hcat", "vcat"]] = None,
     enable_tqdm: Optional[bool] = True,
     output_name: Optional[str] = None,
     video_quality: Literal["low", "medium", "high"] = "high",
@@ -152,3 +153,99 @@ def export_to_gs_video(
             ffmpeg_params=ffmpeg_params,
         )
     return
+
+
+def export_to_gs_views(
+    prediction: Prediction,
+    export_dir: str,
+    extrinsics: Optional[torch.Tensor] = None,  # render views' world2cam, "b v 4 4"
+    intrinsics: Optional[torch.Tensor] = None,  # render views' unnormed intrinsics, "b v 3 3"
+    out_image_hw: Optional[tuple[int, int]] = None,  # render views' resolution, (h, w)
+    chunk_size: Optional[int] = 4,
+    trj_mode: Literal[
+        "original",
+        "smooth",
+        "interpolate",
+        "interpolate_smooth",
+        "wander",
+        "dolly_zoom",
+        "extend",
+        "wobble_inter",
+    ] = "original",
+    color_mode: Literal["RGB+D", "RGB+ED"] = "RGB+ED",
+    enable_tqdm: Optional[bool] = True,
+    output_name: Optional[str] = None,
+    image_format: Literal["png", "jpg", "jpeg"] = "png",
+) -> list[list[str]]:
+    """Render a set of novel-view images from 3DGS and save them to disk.
+
+    This is similar to :func:`export_to_gs_video`, but instead of encoding an mp4,
+    it writes individual frames (novel views) as images. Depth visualization is
+    intentionally omitted (color only), which is typically what metrics such as
+    PSNR/SSIM/LPIPS operate on.
+
+    Returns:
+        A nested list of saved image paths with shape [B][T] where B is the batch
+        dimension of the renderer output and T is the number of rendered views.
+    """
+    gs_world = prediction.gaussians
+
+    # if target poses are not provided, render the (smooth/interpolate) input poses
+    if extrinsics is not None:
+        tgt_extrs = extrinsics
+    else:
+        tgt_extrs = torch.from_numpy(prediction.extrinsics).unsqueeze(0).to(gs_world.means)
+        if prediction.is_metric:
+            scale_factor = prediction.scale_factor
+            if scale_factor is not None:
+                tgt_extrs[:, :, :3, 3] /= scale_factor
+
+    tgt_intrs = (
+        intrinsics
+        if intrinsics is not None
+        else torch.from_numpy(prediction.intrinsics).unsqueeze(0).to(gs_world.means)
+    )
+
+    # if render resolution is not provided, render the input ones
+    if out_image_hw is not None:
+        H, W = out_image_hw
+    else:
+        H, W = prediction.depth.shape[-2:]
+
+    # if single views, render wander trj
+    if tgt_extrs.shape[1] <= 1:
+        trj_mode = "wander"
+
+    color, _depth = run_renderer_in_chunk_w_trj_mode(
+        gaussians=gs_world,
+        extrinsics=tgt_extrs,
+        intrinsics=tgt_intrs,
+        image_shape=(H, W),
+        chunk_size=chunk_size,
+        trj_mode=trj_mode,
+        use_sh=True,
+        color_mode=color_mode,
+        enable_tqdm=enable_tqdm,
+    )
+
+    name = trj_mode if output_name is None else output_name
+    base_dir = os.path.join(export_dir, "gs_views", name)
+    os.makedirs(base_dir, exist_ok=True)
+
+    saved: list[list[str]] = []
+
+    # Expected: color = (B, T, C, H, W), float in [0,1]
+    for b in range(color.shape[0]):
+        view_dir = os.path.join(base_dir, f"view_{b:04d}")
+        os.makedirs(view_dir, exist_ok=True)
+
+        imgs_b = color[b].clamp(0, 1).mul(255).byte().permute(0, 2, 3, 1).cpu().numpy()
+        paths_b: list[str] = []
+        for t, frame in enumerate(imgs_b):
+            out_path = os.path.join(view_dir, f"{t:04d}.{image_format}")
+            Image.fromarray(frame).save(out_path)
+            paths_b.append(out_path)
+
+        saved.append(paths_b)
+
+    return saved

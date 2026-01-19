@@ -7,6 +7,7 @@ import numpy as np
 import torch
 from typing import Dict, List, Optional, Tuple
 from depth_anything_3.api import DepthAnything3
+from depth_anything_3.utils.camera_trj_helpers import cam_trace_visualization
 
 
 def extract_frame_id_from_filename(path: str) -> str:
@@ -506,7 +507,7 @@ def main():
             intrinsics=intrinsics_arr,
             infer_gs=True,  # Enable Gaussian Splatting branch
             export_dir=args.output_dir,  # Directory to save GS outputs
-            export_format="gs_ply",  # Export GS format (can also use "gs_ply-gs_video" for both)
+            export_format="gs_views",
         )
     else:
         prediction = model.inference(
@@ -530,22 +531,27 @@ def main():
     # prediction.intrinsics       : [N, 3, 3]    float32 array
     print("Intrinsics shape:", prediction.intrinsics.shape)
 
-    # GS-specific output
-    # prediction.gaussians        : Gaussian Splatting data
-    if hasattr(prediction, "gaussians"):
-        print("\nGaussian Splatting data available in prediction.gaussians")
-        try:
-            print("GS means shape:", prediction.gaussians.means.shape)
-        except Exception:
-            pass
+    # Add cam pose visualization (camera-only GLB, for trajectory debugging)
+    if prediction.extrinsics is not None and prediction.intrinsics is not None:
+        # Use processed image size if available; fallback to depth size
+        if prediction.processed_images is not None:
+            H, W = prediction.processed_images.shape[1:3]
+        else:
+            H, W = prediction.depth.shape[-2:]
+        cam_trace_visualization(
+            export_dir=args.output_dir,
+            extrinsics_w2c=prediction.extrinsics,  # (N,3,4) or (N,4,4)
+            intrinsics=prediction.intrinsics,  # (N,3,3) or (3,3)
+            image_sizes=(H, W),
+            output_name="camera_trace.glb",
+        )
+        print(
+            f"[INFO] Saved camera trajectory visualization to: {os.path.join(args.output_dir, 'camera_trace.glb')}"
+        )
     else:
-        print("\nWarning: No Gaussian data found. Make sure infer_gs=True is set.")
-
-    # Additional outputs in aux dictionary
-    if hasattr(prediction, "aux"):
-        print("\nAuxiliary outputs available:")
-        for key in prediction.aux.keys():
-            print(f"  - {key}")
+        print(
+            "[WARN] Skip camera trajectory visualization: prediction.extrinsics/intrinsics not available."
+        )
 
 
 if __name__ == "__main__":
