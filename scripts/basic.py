@@ -68,6 +68,17 @@ def main() -> None:
         help="Number of novel-view poses to generate when --novel-orbit is set (default: 120)",
     )
     parser.add_argument(
+        "--render-trace",
+        type=str,
+        default=None,
+        help=(
+            "Path to a trace NPZ (e.g. novel_orbit_poses.npz). If set, will load "
+            "`extrinsics_w2c` and `intrinsics` from the NPZ and pass them to "
+            "`model.inference(render_exts=..., render_ixts=...)`. Relative path is "
+            "resolved under --output-dir."
+        ),
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default=None,
@@ -92,6 +103,21 @@ def main() -> None:
         export_format = "glb"
     infer_gs = "gs" in export_format
 
+    render_exts = None
+    render_ixts = None
+    render_hw = None
+    if args.render_trace is not None:
+        trace_path = args.render_trace
+        if not os.path.isabs(trace_path):
+            trace_path = os.path.join(args.output_dir, trace_path)
+        trace_npz = np.load(trace_path)
+        if "extrinsics_w2c" not in trace_npz or "intrinsics" not in trace_npz:
+            raise KeyError(
+                f"Trace NPZ must contain keys 'extrinsics_w2c' and 'intrinsics', got: {list(trace_npz.keys())}"
+            )
+        render_exts = trace_npz["extrinsics_w2c"]
+        render_ixts = trace_npz["intrinsics"]
+
     model = DepthAnything3.from_pretrained(args.model_dir)
     model = model.to(device=device)
 
@@ -100,6 +126,9 @@ def main() -> None:
         extrinsics=None,
         intrinsics=None,
         infer_gs=infer_gs,
+        render_exts=render_exts,
+        render_ixts=render_ixts,
+        render_hw=render_hw,
         export_dir=args.output_dir,
         export_format=export_format,
     )
