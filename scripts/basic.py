@@ -71,12 +71,7 @@ def main() -> None:
         "--render-trace",
         type=str,
         default=None,
-        help=(
-            "Path to a trace NPZ (e.g. novel_orbit_poses.npz). If set, will load "
-            "`extrinsics_w2c` and `intrinsics` from the NPZ and pass them to "
-            "`model.inference(render_exts=..., render_ixts=...)`. Relative path is "
-            "resolved under --output-dir."
-        ),
+        help=("Absolute path to a trace NPZ."),
     )
     parser.add_argument(
         "--device",
@@ -108,8 +103,9 @@ def main() -> None:
     render_hw = None
     if args.render_trace is not None:
         trace_path = args.render_trace
-        if not os.path.isabs(trace_path):
-            trace_path = os.path.join(args.output_dir, trace_path)
+        if not os.path.exists(trace_path):
+            raise FileNotFoundError(f"--render-trace file not found: {trace_path}")
+
         trace_npz = np.load(trace_path)
         if "extrinsics_w2c" not in trace_npz or "intrinsics" not in trace_npz:
             raise KeyError(
