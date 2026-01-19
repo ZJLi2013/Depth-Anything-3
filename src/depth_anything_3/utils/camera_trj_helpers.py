@@ -12,10 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+
 import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
+import trimesh
 from einops import einsum, rearrange, reduce
 
 try:
@@ -152,6 +155,363 @@ def render_dolly_zoom_path(
     Ks[:, 0, 0] = (fx0 * scale) / w
     Ks[:, 1, 1] = (fy0 * scale) / h
     return c2ws, Ks
+
+
+@torch.no_grad()
+def render_novel_view_orbit_path(
+    extrinsics_w2c: torch.Tensor,
+    intrinsics: torch.Tensor,
+    num_frames: int = 120,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Generate random novel-view camera poses on a sphere around the scene.
+
+    Extremely simple version:
+      1) Use the (robust) median of input camera centers as the sphere center (pivot).
+      2) Use median distance to pivot as the sphere radius.
+      3) Sample random directions on the unit sphere, place cameras at pivot + r * dir.
+      4) Make every camera look at the pivot (look_at).
+
+    Returns:
+        extrinsics_w2c_batched: (1, T, 4, 4)
+        intrinsics_batched: (1, T, 3, 3)
+    """
+    device, dtype = extrinsics_w2c.device, extrinsics_w2c.dtype
+
+    # ---- sanitize shapes ----
+    if extrinsics_w2c.ndim == 4:
+        extr = extrinsics_w2c[0]
+    else:
+        extr = extrinsics_w2c
+    extr = as_homogeneous(extr)  # (V,4,4)
+
+    if intrinsics.ndim == 4:
+        K0 = intrinsics[0, 0]
+    elif intrinsics.ndim == 3:
+        K0 = intrinsics[0]
+    else:
+        K0 = intrinsics
+    K0 = K0.to(device=device, dtype=dtype)
+
+    V = extr.shape[0]
+    if V < 1:
+        raise ValueError(
+            "render_novel_view_orbit_path: extrinsics_w2c must contain at least 1 view"
+        )
+
+    # ---- w2c -> c2w (for centers + up estimation) ----
+    R_w2c = extr[:, :3, :3]
+    t_w2c = extr[:, :3, 3]
+    R_c2w = R_w2c.transpose(1, 2)
+    t_c2w = -(R_c2w @ t_w2c.unsqueeze(-1)).squeeze(-1)
+
+    c2w = torch.eye(4, device=device, dtype=dtype).unsqueeze(0).repeat(V, 1, 1)
+    c2w[:, :3, :3] = R_c2w
+    c2w[:, :3, 3] = t_c2w
+
+    centers = c2w[:, :3, 3]
+    ups = normalize(c2w[:, :3, 1])
+
+    pivot = torch.median(centers, dim=0).values
+    dist_med = torch.median((centers - pivot).norm(dim=-1))
+    radius = dist_med.clamp(min=1e-4)
+
+    up_axis = normalize(ups.mean(dim=0))
+    if up_axis.norm() < 1e-6:
+        up_axis = torch.tensor([0.0, 1.0, 0.0], device=device, dtype=dtype)
+
+    # Build a stable orthonormal basis around up_axis for mapping sampled vectors.
+    tmp = torch.tensor([1.0, 0.0, 0.0], device=device, dtype=dtype)
+    if torch.linalg.cross(tmp, up_axis).norm() < 1e-6:
+        tmp = torch.tensor([0.0, 0.0, 1.0], device=device, dtype=dtype)
+    basis_x = normalize(torch.linalg.cross(tmp, up_axis))  # right
+    basis_z = normalize(torch.linalg.cross(up_axis, basis_x))  # forward
+
+    # Random directions on sphere (uniform).
+    u = torch.rand((num_frames,), device=device, dtype=dtype)
+    v = torch.rand((num_frames,), device=device, dtype=dtype)
+    theta = 2.0 * torch.pi * u
+    z = 2.0 * v - 1.0
+    r_xy = torch.sqrt((1.0 - z * z).clamp(min=0.0))
+    x = r_xy * torch.cos(theta)
+    y = r_xy * torch.sin(theta)
+    dirs_local = torch.stack([x, y, z], dim=-1)  # (T,3)
+
+    # Map to world basis: x->basis_x, y->up_axis, z->basis_z
+    dirs_world = (
+        dirs_local[:, 0:1] * basis_x.unsqueeze(0)
+        + dirs_local[:, 1:2] * up_axis.unsqueeze(0)
+        + dirs_local[:, 2:3] * basis_z.unsqueeze(0)
+    )
+    dirs_world = normalize(dirs_world)
+
+    # ---- build c2w (look-at pivot) then convert to w2c ----
+    c2ws_out = torch.eye(4, device=device, dtype=dtype).unsqueeze(0).repeat(num_frames, 1, 1)
+    pos = pivot.unsqueeze(0) + radius * dirs_world
+    look = normalize(pivot.unsqueeze(0) - pos)
+
+    right = torch.linalg.cross(up_axis.unsqueeze(0).expand_as(look), look)
+    bad = right.norm(dim=-1) < 1e-6
+    if bad.any():
+        right[bad] = torch.linalg.cross(basis_x.unsqueeze(0).expand_as(look[bad]), look[bad])
+    right = normalize(right)
+    up = torch.linalg.cross(look, right)
+
+    c2ws_out[:, :3, 0] = right
+    c2ws_out[:, :3, 1] = up
+    c2ws_out[:, :3, 2] = look
+    c2ws_out[:, :3, 3] = pos
+
+    # Rigid inverse: w2c = [R^T, -R^T t]
+    R = c2ws_out[:, :3, :3]
+    t = c2ws_out[:, :3, 3]
+    Rw2c = R.transpose(1, 2)
+    tw2c = -(Rw2c @ t.unsqueeze(-1)).squeeze(-1)
+
+    w2cs_out = torch.eye(4, device=device, dtype=dtype).unsqueeze(0).repeat(num_frames, 1, 1)
+    w2cs_out[:, :3, :3] = Rw2c
+    w2cs_out[:, :3, 3] = tw2c
+
+    Ks_out = K0.unsqueeze(0).repeat(num_frames, 1, 1)
+    return w2cs_out.unsqueeze(0), Ks_out.unsqueeze(0)
+
+
+# ============================================================
+# Camera trajectory visualization (camera-only glb export)
+# NOTE: intentionally self-contained (no cross-file imports).
+# ============================================================
+
+
+def _as_homogeneous44_np(ext: np.ndarray) -> np.ndarray:
+    """Accept (4,4) or (3,4) extrinsic parameters, return (4,4) homogeneous matrix."""
+    if ext.shape == (4, 4):
+        return ext
+    if ext.shape == (3, 4):
+        H = np.eye(4, dtype=ext.dtype)
+        H[:3, :4] = ext
+        return H
+    raise ValueError(f"extrinsic must be (4,4) or (3,4), got {ext.shape}")
+
+
+def _estimate_scene_scale_np(points: np.ndarray, fallback: float = 1.0) -> float:
+    """Estimate a reasonable scene scale (diagonal length) from a set of 3D points."""
+    if points.shape[0] < 2:
+        return fallback
+    lo = np.percentile(points, 5, axis=0)
+    hi = np.percentile(points, 95, axis=0)
+    diag = np.linalg.norm(hi - lo)
+    return float(diag if np.isfinite(diag) and diag > 0 else fallback)
+
+
+def _hsv_to_rgb_np(h: float, s: float, v: float) -> tuple[float, float, float]:
+    """Convert HSV color (floats in [0,1]) to RGB color (floats in [0,1])."""
+    i = int(h * 6.0)
+    f = h * 6.0 - i
+    p = v * (1.0 - s)
+    q = v * (1.0 - f * s)
+    t = v * (1.0 - (1.0 - f) * s)
+    i = i % 6
+    if i == 0:
+        r, g, b = v, t, p
+    elif i == 1:
+        r, g, b = q, v, p
+    elif i == 2:
+        r, g, b = p, v, t
+    elif i == 3:
+        r, g, b = p, q, v
+    elif i == 4:
+        r, g, b = t, p, v
+    else:
+        r, g, b = v, p, q
+    return r, g, b
+
+
+def _index_color_rgb_np(i: int, n: int) -> np.ndarray:
+    """Get a distinct RGB uint8 color for the i-th item among n (useful for visualization)."""
+    h = (i + 0.5) / max(n, 1)
+    s, v = 0.85, 0.95
+    r, g, b = _hsv_to_rgb_np(h, s, v)
+    return (np.array([r, g, b]) * 255).astype(np.uint8)
+
+
+def _camera_frustum_lines_np(
+    K: np.ndarray, ext_w2c: np.ndarray, W: int, H: int, scale: float
+) -> np.ndarray:
+    corners = np.array(
+        [
+            [0, 0, 1.0],
+            [W - 1, 0, 1.0],
+            [W - 1, H - 1, 1.0],
+            [0, H - 1, 1.0],
+        ],
+        dtype=float,
+    )  # (4,3)
+
+    K_inv = np.linalg.inv(K)
+    c2w = np.linalg.inv(_as_homogeneous44_np(ext_w2c))
+
+    # camera center in world
+    Cw = (c2w @ np.array([0, 0, 0, 1.0]))[:3]
+
+    # rays -> z=1 plane points (camera frame)
+    rays = (K_inv @ corners.T).T
+    z = rays[:, 2:3]
+    z[z == 0] = 1.0
+    plane_cam = (rays / z) * scale  # (4,3)
+
+    # to world
+    plane_w = []
+    for p in plane_cam:
+        pw = (c2w @ np.array([p[0], p[1], p[2], 1.0]))[:3]
+        plane_w.append(pw)
+    plane_w = np.stack(plane_w, 0)  # (4,3)
+
+    segs = []
+    # center to corners
+    for k in range(4):
+        segs.append(np.stack([Cw, plane_w[k]], 0))
+    # rectangle edges
+    order = [0, 1, 2, 3, 0]
+    for a, b in zip(order[:-1], order[1:]):
+        segs.append(np.stack([plane_w[a], plane_w[b]], 0))
+
+    return np.stack(segs, 0)  # (8,2,3)
+
+
+def _add_cameras_to_scene_np(
+    scene: trimesh.Scene,
+    K: np.ndarray,
+    ext_w2c: np.ndarray,
+    image_sizes: list[tuple[int, int]],
+    scale: float,
+) -> None:
+    """Draw camera frustums (wireframe pyramids) into a trimesh.Scene."""
+    N = K.shape[0]
+    if N == 0:
+        return
+
+    # Alignment matrix (use identity if missing)
+    A = None
+    try:
+        A = scene.metadata.get("hf_alignment", None) if scene.metadata else None
+    except Exception:
+        A = None
+    if A is None:
+        A = np.eye(4, dtype=np.float64)
+
+    for i in range(N):
+        H, W = image_sizes[i]
+        segs = _camera_frustum_lines_np(K[i], ext_w2c[i], W, H, scale)  # (8,2,3) world frame
+        segs = trimesh.transform_points(segs.reshape(-1, 3), A).reshape(-1, 2, 3)
+
+        path = trimesh.load_path(segs)
+        color = _index_color_rgb_np(i, N)
+        if hasattr(path, "colors"):
+            path.colors = np.tile(color, (len(path.entities), 1))
+        scene.add_geometry(path)
+
+
+def cam_trace_visualization(
+    export_dir: str,
+    extrinsics_w2c: np.ndarray | torch.Tensor,
+    intrinsics: np.ndarray | torch.Tensor,
+    image_sizes: list[tuple[int, int]] | tuple[int, int],
+    output_name: str = "camera_trace.glb",
+    camera_size: float = 0.03,
+    align_to_gltf: bool = True,
+) -> str:
+    """Export a camera-only GLB for trajectory visualization (no point cloud, no mesh).
+
+    Args:
+        export_dir: Output directory.
+        extrinsics_w2c: (V,4,4)/(V,3,4) in w2c. Torch or numpy is accepted.
+        intrinsics: (V,3,3) or (3,3). Torch or numpy is accepted.
+        image_sizes: Either a single (H,W) tuple or a list of (H,W) per view.
+        output_name: Output GLB file name.
+        camera_size: Relative camera frustum scale (fraction of scene diagonal).
+        align_to_gltf: If True, convert from CV camera frame to glTF (flip Y/Z) and
+            center by camera centers.
+
+    Returns:
+        Path to the exported glb file.
+    """
+    os.makedirs(export_dir, exist_ok=True)
+    out_path = os.path.join(export_dir, output_name)
+
+    ext = (
+        extrinsics_w2c.detach().cpu().numpy()
+        if isinstance(extrinsics_w2c, torch.Tensor)
+        else extrinsics_w2c
+    )
+    K = intrinsics.detach().cpu().numpy() if isinstance(intrinsics, torch.Tensor) else intrinsics
+
+    if ext.ndim != 3:
+        raise ValueError(f"extrinsics_w2c must be (V,*,*), got shape {ext.shape}")
+
+    V = ext.shape[0]
+    ext = np.stack([_as_homogeneous44_np(ext[i]) for i in range(V)], axis=0).astype(np.float64)
+
+    if K.ndim == 2:
+        K = np.broadcast_to(K[None, ...], (V, 3, 3)).copy()
+    elif K.ndim == 3:
+        if K.shape[0] != V:
+            raise ValueError(f"intrinsics has {K.shape[0]} views but extrinsics has {V}")
+    else:
+        raise ValueError(f"intrinsics must be (3,3) or (V,3,3), got shape {K.shape}")
+
+    if isinstance(image_sizes, tuple):
+        image_sizes_list = [image_sizes] * V
+    else:
+        image_sizes_list = list(image_sizes)
+        if len(image_sizes_list) != V:
+            raise ValueError(f"image_sizes must have length {V}, got {len(image_sizes_list)}")
+
+    # Compute camera centers (world frame) for centering/scale.
+    centers = []
+    for i in range(V):
+        c2w = np.linalg.inv(ext[i])
+        centers.append((c2w @ np.array([0, 0, 0, 1.0]))[:3])
+    centers = np.stack(centers, axis=0).astype(np.float64)
+
+    scene = trimesh.Scene()
+    if scene.metadata is None:
+        scene.metadata = {}
+
+    if align_to_gltf:
+        # CV -> glTF axis transformation (flip Y and Z)
+        M = np.eye(4, dtype=np.float64)
+        M[1, 1] = -1.0
+        M[2, 2] = -1.0
+
+        # Align to the first camera orientation first
+        A_no_center = M @ ext[0]
+
+        # Center by camera centers (median for robustness)
+        centers_tmp = trimesh.transform_points(centers, A_no_center)
+        center = np.median(centers_tmp, axis=0)
+
+        T_center = np.eye(4, dtype=np.float64)
+        T_center[:3, 3] = -center
+
+        A = T_center @ A_no_center
+    else:
+        A = np.eye(4, dtype=np.float64)
+
+    scene.metadata["hf_alignment"] = A
+
+    # Estimate scale from transformed camera centers
+    centers_aligned = trimesh.transform_points(centers, A)
+    scene_scale = _estimate_scene_scale_np(centers_aligned, fallback=1.0)
+
+    _add_cameras_to_scene_np(
+        scene=scene,
+        K=K,
+        ext_w2c=ext,
+        image_sizes=image_sizes_list,
+        scale=scene_scale * camera_size,
+    )
+
+    scene.export(out_path)
+    return out_path
 
 
 @torch.no_grad()

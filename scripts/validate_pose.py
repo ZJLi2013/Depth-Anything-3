@@ -12,10 +12,10 @@ from depth_anything_3.utils.pose_align import align_poses_umeyama
 
 """
 1) Geometry-only algebra check
-python scripts/validate_pose.py --check-extrinsics --extrinsics-jsonl /dataset/hypersim/ai_001_001/_detail/cam_00/extrinsics.jsonl
+python scripts/validate_pose.py --check-extrinsics --extrinsics-jsonl /dataset/hypersim/ai_001_001/_detail/cam_00/extrinsics.jsonl --num-frames 10 
 
 2) multi-frames scale check (required >= 3 frames)
-python scripts/validate_pose.py --check-scale  --images-dir /dataset/hypersim/diffused/rgb_input/  --num-frames 8   --intrinsics-json  /dataset/hypersim/ai_001_001/_detail/cam_00/intrinsics.jsonl    --extrinsics-jsonl /dataset/hypersim/ai_001_001/_detail/cam_00/extrinsics.jsonl --output-dir /dataset/hypersim/color/c2w_validate  
+python scripts/validate_pose.py --check-scale  --images-dir /dataset/hypersim/diffused/rgb_input/  --num-frames 8   --intrinsics-json  /dataset/hypersim/ai_001_001/_detail/cam_00/intrinsics.jsonl    --extrinsics-jsonl /dataset/hypersim/ai_001_001/_detail/cam_00/extrinsics.jsonl --output-dir /dataset/hypersim/color/validate  
 
 """
 

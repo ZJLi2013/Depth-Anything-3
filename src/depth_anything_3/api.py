@@ -240,12 +240,30 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         if export_dir is not None:
 
             if "gs" in export_format:
-                if infer_gs and "gs_video" not in export_format:
+                # Backward-compatible behavior: if user requests a GS-related export but didn't
+                # explicitly ask for gs_video/gs_views, we append gs_video by default.
+                if (
+                    infer_gs
+                    and "gs_video" not in export_format
+                    and "gs_views" not in export_format
+                ):
                     export_format = f"{export_format}-gs_video"
+
                 if "gs_video" in export_format:
                     if "gs_video" not in export_kwargs:
                         export_kwargs["gs_video"] = {}
                     export_kwargs["gs_video"].update(
+                        {
+                            "extrinsics": render_exts,
+                            "intrinsics": render_ixts,
+                            "out_image_hw": render_hw,
+                        }
+                    )
+
+                if "gs_views" in export_format:
+                    if "gs_views" not in export_kwargs:
+                        export_kwargs["gs_views"] = {}
+                    export_kwargs["gs_views"].update(
                         {
                             "extrinsics": render_exts,
                             "intrinsics": render_ixts,
