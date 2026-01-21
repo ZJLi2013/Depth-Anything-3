@@ -183,159 +183,6 @@ def export_to_glb(
         os.system(f"cp -r {export_dir}/depth_vis/0000.jpg {export_dir}/scene.jpg")
     return out_path
 
-def postprocess_glb_add_cameras(
-    scene_glb_path: str,
-    out_glb_path: str,
-    *,
-    default_extrinsics_w2c: np.ndarray,
-    default_intrinsics: np.ndarray,
-    default_image_size_hw: tuple[int, int],
-    default_color_rgb: tuple[int, int, int] = (0, 128, 255),
-    novel_extrinsics_w2c: np.ndarray | None = None,
-    novel_intrinsics: np.ndarray | None = None,
-    novel_image_size_hw: tuple[int, int] | None = None,
-    novel_color_rgb: tuple[int, int, int] = (255, 64, 64),
-    camera_size: float = 0.03,
-    cleanup_old_cameras: bool = True,
-    cleanup_vertices_threshold: int = 1000,
-) -> str:
-    """Post-process an existing ``scene.glb`` by (re)adding camera frustums.
-
-    Motivation:
-        `trimesh` glTF round-trip can drop line/path colors, so a robust way to ensure
-        camera colors is to redraw them from input extrinsics/intrinsics.
-
-    Behavior:
-        - Loads ``scene_glb_path`` as a ``trimesh.Scene``.
-        - Reuses ``scene.metadata['hf_alignment']`` if present (consistent with DA3 export).
-        - Optionally removes small geometries (usually old camera frustums).
-        - Adds default camera frustums with a fixed color (blue by default).
-        - Optionally adds novel camera frustums with another fixed color (red by default).
-        - Exports to ``out_glb_path``.
-
-    Args:
-        scene_glb_path: Path to the existing glb file to read (e.g. ``.../scene.glb``).
-        out_glb_path: Output glb path to write.
-        default_extrinsics_w2c: (N,4,4) or (N,3,4) camera extrinsics in w2c.
-        default_intrinsics: (N,3,3) or (3,3) intrinsics.
-        default_image_size_hw: (H,W) of the images used to define the frustum geometry.
-        default_color_rgb: RGB uint8-ish tuple for default cameras.
-        novel_extrinsics_w2c: Optional (T,4,4)/(T,3,4) w2c extrinsics to add.
-        novel_intrinsics: Optional (T,3,3) or (3,3) intrinsics to add.
-        novel_image_size_hw: If omitted, defaults to ``default_image_size_hw``.
-        novel_color_rgb: RGB tuple for novel cameras.
-        camera_size: Relative camera wireframe scale (fraction of scene diagonal).
-        cleanup_old_cameras: If True, delete small geometries before adding cameras.
-        cleanup_vertices_threshold: "Small geometry" cutoff; tuned to keep point clouds.
-
-    Returns:
-        out_glb_path
-    """
-    if not os.path.exists(scene_glb_path):
-        raise FileNotFoundError(f"scene_glb_path not found: {scene_glb_path}")
-
-    scene = trimesh.load(scene_glb_path, force="scene")
-
-    # Alignment matrix (consistent with point cloud; use identity if missing).
-    A = None
-    try:
-        A = scene.metadata.get("hf_alignment", None) if scene.metadata else None
-    except Exception:
-        A = None
-    if A is None:
-        logger.warn(
-            "scene.glb metadata['hf_alignment'] missing; cameras may not align with point cloud."
-        )
-        A = np.eye(4, dtype=np.float64)
-
-    if cleanup_old_cameras:
-        # Heuristic: DA3 camera frustums are tiny (few vertices). Keep large geometries.
-        for geom_name, geom in list(scene.geometry.items()):
-            v = getattr(geom, "vertices", None)
-            if v is None:
-                continue
-            try:
-                n_v = len(v)
-            except Exception:
-                continue
-            if n_v < cleanup_vertices_threshold:
-                try:
-                    scene.delete_geometry(geom_name)
-                except Exception:
-                    pass
-
-    def _to_ks(K: np.ndarray, n: int) -> np.ndarray:
-        if K.ndim == 2:
-            return np.broadcast_to(K[None, ...], (n, 3, 3))
-        return K
-
-    def _add_camera_set(
-        name: str,
-        ext_w2c: np.ndarray,
-        K: np.ndarray,
-        image_size_hw: tuple[int, int],
-        color_rgb: tuple[int, int, int],
-        scale: float,
-    ) -> None:
-        H, W = image_size_hw
-        n = ext_w2c.shape[0]
-        K = _to_ks(K, n)
-        segs = []
-        for i in range(n):
-            segs_i = _camera_frustum_lines(K[i], ext_w2c[i], W, H, scale)  # (8,2,3)
-            segs.append(segs_i)
-        segs = np.concatenate(segs, axis=0)  # (n*8,2,3)
-        segs = trimesh.transform_points(segs.reshape(-1, 3), A).reshape(-1, 2, 3)
-
-        path = trimesh.load_path(segs)
-        color = np.array(color_rgb, dtype=np.uint8)
-        if hasattr(path, "colors"):
-            path.colors = np.tile(color, (len(path.entities), 1))
-        scene.add_geometry(path, geom_name=name)
-
-    # Estimate scene scale from whatever geometry remains.
-    # Use diagonal length of scene bounds as a stable heuristic.
-    diag = 1.0
-    try:
-        if scene.bounds is not None:
-            lo, hi = scene.bounds
-            diag = float(np.linalg.norm(hi - lo))
-    except Exception:
-        diag = 1.0
-    if not np.isfinite(diag) or diag <= 0:
-        diag = 1.0
-    cam_scale = diag * camera_size
-
-    default_extrinsics_w2c = np.asarray(default_extrinsics_w2c)
-    default_intrinsics = np.asarray(default_intrinsics)
-    _add_camera_set(
-        name="default_cameras",
-        ext_w2c=default_extrinsics_w2c,
-        K=default_intrinsics,
-        image_size_hw=default_image_size_hw,
-        color_rgb=default_color_rgb,
-        scale=cam_scale,
-    )
-
-    if novel_extrinsics_w2c is not None:
-        novel_extrinsics_w2c = np.asarray(novel_extrinsics_w2c)
-        novel_intrinsics = np.asarray(novel_intrinsics) if novel_intrinsics is not None else None
-        if novel_intrinsics is None:
-            raise ValueError("novel_intrinsics is required when novel_extrinsics_w2c is provided.")
-        _add_camera_set(
-            name="novel_cameras",
-            ext_w2c=novel_extrinsics_w2c,
-            K=novel_intrinsics,
-            image_size_hw=default_image_size_hw if novel_image_size_hw is None else novel_image_size_hw,
-            color_rgb=novel_color_rgb,
-            scale=cam_scale,
-        )
-
-    os.makedirs(os.path.dirname(out_glb_path) or ".", exist_ok=True)
-    scene.export(out_glb_path)
-    return out_glb_path
-
-
 # =========================
 # utilities
 # =========================
@@ -509,6 +356,74 @@ def _add_cameras_to_scene(
         if hasattr(path, "colors"):
             path.colors = np.tile(color, (len(path.entities), 1))
         scene.add_geometry(path)
+
+
+def dump_camera_poses_npz(
+    export_dir: str,
+    extrinsics_w2c: np.ndarray,
+    intrinsics: np.ndarray,
+    *,
+    output_name: str = "poses.npz",
+    hf_alignment_world_to_gltf: np.ndarray | None = None,
+    image_size_hw: tuple[int, int] | None = None,
+    frame_ids: np.ndarray | None = None,
+) -> str:
+    """Dump camera poses to a compressed NPZ file.
+
+    Saves:
+      - extrinsics_w2c: (N,4,4) w2c matrices (homogeneous)
+      - intrinsics: (N,3,3) (broadcasted if input is (3,3))
+    Optionally saves:
+      - hf_alignment_world_to_gltf: (4,4) matrix used by DA3 GLB export
+      - extrinsics_w2c_aligned: (N,4,4) where the world frame is transformed by
+        hf_alignment_world_to_gltf (X' = A X), i.e. w2c' = w2c @ inv(A)
+      - image_size_hw: (H,W)
+    """
+    os.makedirs(export_dir, exist_ok=True)
+    out_path = os.path.join(export_dir, output_name)
+
+    ext = np.asarray(extrinsics_w2c)
+    if ext.ndim != 3:
+        raise ValueError(f"extrinsics_w2c must be (N,*,*), got {ext.shape}")
+    N = ext.shape[0]
+    ext44 = np.stack([_as_homogeneous44(ext[i]) for i in range(N)], axis=0).astype(np.float64)
+
+    K = np.asarray(intrinsics)
+    if K.ndim == 2:
+        K = np.broadcast_to(K[None, ...], (N, 3, 3)).copy()
+    elif K.ndim == 3:
+        if K.shape[0] != N:
+            raise ValueError(f"intrinsics has {K.shape[0]} views but extrinsics has {N}")
+    else:
+        raise ValueError(f"intrinsics must be (3,3) or (N,3,3), got {K.shape}")
+
+    save_kwargs: dict[str, np.ndarray] = {
+        "extrinsics_w2c": ext44.astype(np.float32),
+        "intrinsics": K.astype(np.float32),
+    }
+
+    if frame_ids is not None:
+        frame_ids = np.asarray(frame_ids)
+        if frame_ids.shape != (N,):
+            raise ValueError(f"frame_ids must be shape (N,), got {frame_ids.shape} (N={N})")
+        save_kwargs["frame_ids"] = frame_ids.astype(np.int32)
+
+    if hf_alignment_world_to_gltf is not None:
+        A = np.asarray(hf_alignment_world_to_gltf).astype(np.float64)
+        if A.shape != (4, 4):
+            raise ValueError(f"hf_alignment_world_to_gltf must be (4,4), got {A.shape}")
+        save_kwargs["hf_alignment_world_to_gltf"] = A.astype(np.float32)
+
+        A_inv = np.linalg.inv(A)
+        ext44_aligned = ext44 @ A_inv  # w2c' = w2c @ inv(A) under X' = A X
+        save_kwargs["extrinsics_w2c_aligned"] = ext44_aligned.astype(np.float32)
+
+    if image_size_hw is not None:
+        H, W = image_size_hw
+        save_kwargs["image_size_hw"] = np.asarray([H, W], dtype=np.int32)
+
+    np.savez_compressed(out_path, **save_kwargs)
+    return out_path
 
 
 def _camera_frustum_lines(

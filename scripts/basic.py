@@ -1,14 +1,15 @@
 import argparse
 import glob
 import os
+import re
 from typing import List
 
 import numpy as np
 import torch
 
 from depth_anything_3.api import DepthAnything3
-from depth_anything_3.utils.camera_trj_helpers import render_novel_view_orbit_path
-from depth_anything_3.utils.export.glb import  postprocess_glb_add_cameras
+from depth_anything_3.utils.camera_trj_helpers import cam_trace_visualization
+from depth_anything_3.utils.export.glb import dump_camera_poses_npz
 
 def gather_images(input_dir: str) -> List[str]:
     image_extensions = ["*.png", "*.jpg", "*.jpeg", "*.PNG", "*.JPG", "*.JPEG"]
@@ -45,18 +46,6 @@ def main() -> None:
         type=str,
         default=None,
         help=("Export format string passed to DA3 (e.g. glb, gs_views). " "If omitted: glb."),
-    )
-    parser.add_argument(
-        "--novel-orbit",
-        action="store_true",
-        help="Generate novel-view poses and export to --output-dir (novel_orbit_poses.npz + *_trace.glb).",
-    )
-    parser.add_argument(
-        "--novel-orbit-frames",
-        dest="novel_orbit_frames",
-        type=int,
-        default=40,
-        help="Number of novel-view poses to generate when --novel-orbit is set (default: 40)",
     )
     parser.add_argument(
         "--render-trace",
@@ -156,56 +145,53 @@ def main() -> None:
     if prediction.intrinsics is not None:
         print("Intrinsics shape:", prediction.intrinsics.shape)
 
-    # Determine image size (needed for camera frustums)
+    # Determine image size (needed for camera trace visualization)
     H = W = None
     if prediction.processed_images is not None:
         H, W = prediction.processed_images.shape[1:3]
     elif prediction.depth is not None:
         H, W = prediction.depth.shape[-2:]
 
-    # novel view poses generation and visualization
-    if args.novel_orbit:
+    # For GLB exports: dump camera poses (for later gs_views render_trace) and visualize them.
+    # IMPORTANT: poses.npz must stay in the same coordinate system as prediction.extrinsics/intrinsics
+    # because gs_views render_trace expects DA3's original w2c/intrinsics.
+    if "glb" in export_format:
         if prediction.extrinsics is None or prediction.intrinsics is None:
-            print("[WARN] Skip novel orbit: prediction.extrinsics/intrinsics not available.")
+            print("[WARN] Skip pose dump: prediction.extrinsics/intrinsics not available.")
         else:
-            ex_w2c = torch.from_numpy(prediction.extrinsics).to(device)
-            in_k = torch.from_numpy(prediction.intrinsics).to(device)
-            novel_w2c_b, novel_k_b = render_novel_view_orbit_path(
-                extrinsics_w2c=ex_w2c,
-                intrinsics=in_k,
-                num_frames=int(args.novel_orbit_frames))
+            # Parse frame_id from input image file names in the SAME order as `images`
+            # (so frame_ids[i] aligns with extrinsics_w2c[i]).
+            frame_ids_list: list[int] = []
+            for img_path in images:
+                base = os.path.basename(img_path)
+                m = re.search(r"frame\.(\d+)\.color\.", base)
+                frame_ids_list.append(int(m.group(1)) if m else -1)
+            frame_ids = np.asarray(frame_ids_list, dtype=np.int32)
 
-            # Save as npz on CPU
-            novel_w2c = novel_w2c_b.squeeze(0).detach().cpu().numpy()  # (T,4,4)
-            novel_k = novel_k_b.squeeze(0).detach().cpu().numpy()  # (T,3,3)
+            poses_path = dump_camera_poses_npz(
+                export_dir=args.output_dir,
+                extrinsics_w2c=prediction.extrinsics,
+                intrinsics=prediction.intrinsics,
+                output_name="poses.npz",
+                image_size_hw=(int(H), int(W)) if (H is not None and W is not None) else None,
+                frame_ids=frame_ids,
+            )
+            print(f"[INFO] Saved camera poses to: {poses_path}")
 
-            out_npz = os.path.join(args.output_dir, "novel_orbit_poses.npz")
-            np.savez_compressed(out_npz, extrinsics_w2c=novel_w2c, intrinsics=novel_k)
-            print(f"[INFO] Saved novel orbit poses to: {out_npz}")
-
-            # Post-process `scene.glb` by rebuilding default cameras (blue) and adding novel cameras (red).
-            if "glb" in export_format:
-                scene_path = os.path.join(args.output_dir, "scene.glb")
-                out_glb = os.path.join(args.output_dir, "scene_with_novel_orbit.glb")
-                if os.path.exists(scene_path):
-                    if H is None or W is None:
-                        raise ValueError("Cannot determine (H,W) from prediction for camera frustums.")
-                    postprocess_glb_add_cameras(
-                        scene_glb_path=scene_path,
-                        out_glb_path=out_glb,
-                        default_extrinsics_w2c=prediction.extrinsics,
-                        default_intrinsics=prediction.intrinsics,
-                        default_image_size_hw=(int(H), int(W)),
-                        default_color_rgb=(0, 128, 255),
-                        novel_extrinsics_w2c=novel_w2c,
-                        novel_intrinsics=novel_k,
-                        novel_color_rgb=(255, 64, 64),
-                        camera_size=0.03,
-                        cleanup_old_cameras=True,
-                    )
-                    print(f"[INFO] Saved GLB with novel-orbit cameras to: {out_glb}")
-                else:
-                    print(f"[WARN] scene.glb not found at {scene_path}; skip novel-orbit GLB post-process.")
+            if H is None or W is None:
+                print("[WARN] Cannot determine (H,W); skip cam_trace_visualization.")
+            else:
+                poses_npz = np.load(poses_path)
+                trace_path = cam_trace_visualization(
+                    export_dir=args.output_dir,
+                    extrinsics_w2c=poses_npz["extrinsics_w2c"],
+                    intrinsics=poses_npz["intrinsics"],
+                    image_sizes=(int(H), int(W)),
+                    output_name="poses_trace.glb",
+                    camera_size=0.03,
+                    align_to_gltf=True,
+                )
+                print(f"[INFO] Saved camera trace visualization to: {trace_path}")
 
 
 if __name__ == "__main__":
