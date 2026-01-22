@@ -54,6 +54,16 @@ def main() -> None:
         help=("Absolute path to a trace NPZ."),
     )
     parser.add_argument(
+        "--input-poses",
+        type=str,
+        default=None,
+        help=(
+            "Absolute path to an input poses NPZ. If provided, will use its "
+            "extrinsics_w2c/intrinsics (matched by frame_ids) as input extrinsics/intrinsics "
+            "to lock reconstruction in the same coordinate system."
+        ),
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default=None,
@@ -68,6 +78,15 @@ def main() -> None:
     if len(images) == 0:
         raise ValueError("No images found. Supported formats: png, jpg, jpeg (case-insensitive)")
 
+    # Parse frame_ids from input image file names in the SAME order as `images`.
+    # frame_ids[i] aligns with any prediction outputs in view dimension i.
+    frame_ids_list: list[int] = []
+    for img_path in images:
+        base = os.path.basename(img_path)
+        m = re.search(r"frame\.(\d+)\.color\.", base)
+        frame_ids_list.append(int(m.group(1)) if m else -1)
+    frame_ids = np.asarray(frame_ids_list, dtype=np.int32)
+
     if args.device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
@@ -78,6 +97,11 @@ def main() -> None:
         export_format = "glb"
     infer_gs = "gs" in export_format
 
+    # When rendering with a trace (gs_views), the output render resolution (render_hw)
+    # must be consistent with the intrinsics stored in the poses/trace NPZ.
+    # We try to infer this from `image_size_hw` saved in NPZs.
+    input_hw = None  # (H, W)
+
     render_exts = None
     render_ixts = None
     render_hw = None
@@ -87,6 +111,10 @@ def main() -> None:
             raise FileNotFoundError(f"--render-trace file not found: {trace_path}")
 
         trace_npz = np.load(trace_path)
+        if "image_size_hw" in trace_npz:
+            hw = np.asarray(trace_npz["image_size_hw"]).reshape(-1).tolist()
+            if len(hw) == 2:
+                input_hw = (int(hw[0]), int(hw[1]))
         if "extrinsics_w2c" not in trace_npz or "intrinsics" not in trace_npz:
             raise KeyError(
                 f"Trace NPZ must contain keys 'extrinsics_w2c' and 'intrinsics', got: {list(trace_npz.keys())}"
@@ -118,13 +146,68 @@ def main() -> None:
                 f"intrinsics must be (3,3)/(V,3,3) or (B,V,3,3), got {tuple(render_ixts.shape)}"
             )
 
+    # Optional: lock reconstruction to a provided poses.npz coordinate system
+    input_exts = None
+    input_ixts = None
+    if args.input_poses is not None:
+        poses_path = args.input_poses
+        if not os.path.exists(poses_path):
+            raise FileNotFoundError(f"--input-poses file not found: {poses_path}")
+
+        poses_npz = np.load(poses_path)
+        if "image_size_hw" in poses_npz:
+            hw = np.asarray(poses_npz["image_size_hw"]).reshape(-1).tolist()
+            if len(hw) == 2:
+                poses_hw = (int(hw[0]), int(hw[1]))
+                if input_hw is None:
+                    input_hw = poses_hw
+                elif input_hw != poses_hw:
+                    print(
+                        f"[WARN] image_size_hw mismatch: render/trace HW={input_hw}, input_poses HW={poses_hw}. "
+                        "Rendering may look blurry/misaligned."
+                    )
+        for k in ("extrinsics_w2c", "intrinsics", "frame_ids"):
+            if k not in poses_npz:
+                raise KeyError(
+                    f"--input-poses NPZ must contain key '{k}', got keys: {list(poses_npz.keys())}"
+                )
+
+        poses_frame_ids = np.asarray(poses_npz["frame_ids"]).astype(np.int32)
+        if poses_frame_ids.ndim != 1:
+            raise ValueError(f"--input-poses frame_ids must be 1D, got {poses_frame_ids.shape}")
+
+        # In our dataset, poses_npz is assumed to be index-aligned with input images:
+        # extrinsics_w2c[i] / intrinsics[i] correspond to images[i].
+        input_exts = np.asarray(poses_npz["extrinsics_w2c"])
+        input_ixts = np.asarray(poses_npz["intrinsics"])
+
+        assert input_exts.shape[0] == len(images), (
+            f"--input-poses extrinsics_w2c views ({input_exts.shape[0]}) must match "
+            f"number of input images ({len(images)})."
+        )
+        assert poses_frame_ids.shape[0] == len(images), (
+            f"--input-poses frame_ids views ({poses_frame_ids.shape[0]}) must match "
+            f"number of input images ({len(images)})."
+        )
+
+        if input_ixts.ndim == 2:
+            input_ixts = np.broadcast_to(input_ixts[None, ...], (len(images), 3, 3)).copy()
+        else:
+            assert input_ixts.shape[0] == len(images), (
+                f"--input-poses intrinsics views ({input_ixts.shape[0]}) must match "
+                f"number of input images ({len(images)})."
+            )
+
+    # If we inferred an input/render resolution from poses/trace, use it for rendering.
+    render_hw = input_hw
+
     model = DepthAnything3.from_pretrained(args.model_dir)
     model = model.to(device=device)
 
     prediction = model.inference(
         images,
-        extrinsics=None,
-        intrinsics=None,
+        extrinsics=input_exts,
+        intrinsics=input_ixts,
         infer_gs=infer_gs,
         render_exts=render_exts,
         render_ixts=render_ixts,
@@ -156,18 +239,6 @@ def main() -> None:
     # IMPORTANT: poses.npz must stay in the same coordinate system as prediction.extrinsics/intrinsics
     # because gs_views render_trace expects DA3's original w2c/intrinsics.
     if "glb" in export_format:
-        if prediction.extrinsics is None or prediction.intrinsics is None:
-            print("[WARN] Skip pose dump: prediction.extrinsics/intrinsics not available.")
-        else:
-            # Parse frame_id from input image file names in the SAME order as `images`
-            # (so frame_ids[i] aligns with extrinsics_w2c[i]).
-            frame_ids_list: list[int] = []
-            for img_path in images:
-                base = os.path.basename(img_path)
-                m = re.search(r"frame\.(\d+)\.color\.", base)
-                frame_ids_list.append(int(m.group(1)) if m else -1)
-            frame_ids = np.asarray(frame_ids_list, dtype=np.int32)
-
             poses_path = dump_camera_poses_npz(
                 export_dir=args.output_dir,
                 extrinsics_w2c=prediction.extrinsics,

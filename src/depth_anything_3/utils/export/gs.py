@@ -15,6 +15,7 @@
 import os
 from typing import Literal, Optional
 import moviepy.editor as mpy
+import numpy as np
 import torch
 from PIL import Image
 
@@ -22,6 +23,7 @@ from depth_anything_3.model.utils.gs_renderer import run_renderer_in_chunk_w_trj
 from depth_anything_3.specs import Prediction
 from depth_anything_3.utils.gsply_helpers import save_gaussian_ply
 from depth_anything_3.utils.layout_helpers import hcat, vcat
+from depth_anything_3.utils.pose_align import align_poses_umeyama
 from depth_anything_3.utils.visualize import vis_depth_map_tensor
 
 VIDEO_QUALITY_MAP = {
@@ -176,6 +178,8 @@ def export_to_gs_views(
     enable_tqdm: Optional[bool] = True,
     output_name: Optional[str] = None,
     image_format: Literal["png", "jpg", "jpeg"] = "png",
+    align_extrinsics_to_prediction: bool = True,
+    align_ransac: bool = False,
 ) -> list[list[str]]:
     """Render a set of novel-view images from 3DGS and save them to disk.
 
@@ -190,15 +194,129 @@ def export_to_gs_views(
     """
     gs_world = prediction.gaussians
 
-    # if target poses are not provided, render the (smooth/interpolate) input poses
+    # Reference extrinsics: the same coordinate system used to render well by default.
+    ref_extrs = torch.from_numpy(prediction.extrinsics).unsqueeze(0).to(gs_world.means)
+    if prediction.is_metric:
+        scale_factor = prediction.scale_factor
+        if scale_factor is not None:
+            ref_extrs[:, :, :3, 3] /= scale_factor
+
+    # If target poses are not provided, render the input poses (in the same coord as gaussians).
     if extrinsics is not None:
-        tgt_extrs = extrinsics
-    else:
-        tgt_extrs = torch.from_numpy(prediction.extrinsics).unsqueeze(0).to(gs_world.means)
+        tgt_extrs = extrinsics.to(gs_world.means)
+        # If prediction.is_metric, make the provided extrinsics consistent with gaussians coord too.
         if prediction.is_metric:
             scale_factor = prediction.scale_factor
             if scale_factor is not None:
+                tgt_extrs = tgt_extrs.clone()
                 tgt_extrs[:, :, :3, 3] /= scale_factor
+
+        # Optional: align provided extrinsics to the prediction coordinate system (gaussians coord).
+        # This avoids severe blur/ghosting when `extrinsics` come from a different run / coordinate system.
+        if align_extrinsics_to_prediction:
+            # Ensure (B,V,4,4)
+            if tgt_extrs.shape[-2:] == (3, 4):
+                pad = torch.zeros((*tgt_extrs.shape[:-2], 4, 4), dtype=tgt_extrs.dtype, device=tgt_extrs.device)
+                pad[..., :3, :4] = tgt_extrs
+                pad[..., 3, 3] = 1.0
+                tgt_extrs_44 = pad
+            else:
+                tgt_extrs_44 = tgt_extrs
+
+            if ref_extrs.shape[-2:] == (3, 4):
+                pad = torch.zeros((*ref_extrs.shape[:-2], 4, 4), dtype=ref_extrs.dtype, device=ref_extrs.device)
+                pad[..., :3, :4] = ref_extrs
+                pad[..., 3, 3] = 1.0
+                ref_extrs_44 = pad
+            else:
+                ref_extrs_44 = ref_extrs
+
+            # Align each batch element to the same reference (batch=0) trajectory.
+            # If ref/est have the same length, we can directly estimate a Sim(3) with Umeyama.
+            # If lengths differ (e.g., recon vs NVS subset with no 1-1 correspondence), we fall back to a
+            # simple "gauge mapping" using only camera-center mean/std (scale+translation, no rotation).
+            ref_np_full = ref_extrs_44[0].detach().cpu().numpy()
+
+            v_ref = ref_extrs_44.shape[1]
+            v_est = tgt_extrs_44.shape[1]
+
+            # Convert w2c -> c2w to access camera centers in world.
+            with torch.no_grad():
+                ref_c2w_full = torch.linalg.inv(ref_extrs_44[0])  # (Vref,4,4)
+                ref_centers_full = ref_c2w_full[:, :3, 3]  # (Vref,3)
+
+            aligned_batches = []
+            for b in range(tgt_extrs_44.shape[0]):
+                est_np_full = tgt_extrs_44[b].detach().cpu().numpy()
+
+                if v_ref == v_est and v_ref >= 3:
+                    # True Sim(3) alignment (requires same number of poses / 1-1 correspondence).
+                    r, t, s, est_aligned_full = align_poses_umeyama(
+                        ext_ref=ref_np_full,
+                        ext_est=est_np_full,
+                        return_aligned=True,
+                        ransac=align_ransac,
+                        random_state=42,
+                    )
+                    try:
+                        angle_deg = float(np.degrees(np.arccos(np.clip((np.trace(r) - 1.0) * 0.5, -1.0, 1.0))))
+                        print(
+                            "[gs_views][align] sim3(full): "
+                            f"ref={v_ref}, est={v_est}, s={float(s):.6f}, |t|={float(np.linalg.norm(t)):.6f}, rot_deg={angle_deg:.6f}"
+                        )
+                    except Exception:
+                        pass
+
+                    aligned_batches.append(torch.from_numpy(est_aligned_full).to(tgt_extrs_44))
+                    continue
+
+                # Fallback: gauge mapping based on camera centers (no rotation).
+                with torch.no_grad():
+                    est_c2w_full = torch.linalg.inv(tgt_extrs_44[b])  # (Vest,4,4)
+                    est_centers_full = est_c2w_full[:, :3, 3]  # (Vest,3)
+
+                    mu_ref = ref_centers_full.mean(dim=0)
+                    mu_est = est_centers_full.mean(dim=0)
+
+                    # Use RMS radius as "sigma" (more stable than per-axis std for trajectories).
+                    sigma_ref = (ref_centers_full - mu_ref).norm(dim=1).mean().clamp(min=1e-6)
+                    sigma_est = (est_centers_full - mu_est).norm(dim=1).mean().clamp(min=1e-6)
+
+                    s_map = (sigma_ref / sigma_est).item()
+                    t_map = (mu_ref - s_map * mu_est).cpu().numpy()
+
+                    pre_center_diff = (est_centers_full - mu_est).norm(dim=1).mean().item()
+                    print(
+                        "[gs_views][align] gauge_map: "
+                        f"ref={v_ref}, est={v_est}, s={s_map:.6f}, |t|={float(np.linalg.norm(t_map)):.6f}, "
+                        f"sigma_ref={sigma_ref.item():.6f}, sigma_est={sigma_est.item():.6f}, pre_mean_radius={pre_center_diff:.6f}"
+                    )
+
+                    # Apply mapping: C' = s*C + t
+                    est_centers_aligned = est_centers_full * s_map + torch.as_tensor(
+                        t_map, device=est_centers_full.device, dtype=est_centers_full.dtype
+                    )
+
+                    # Update c2w translations, keep rotations unchanged.
+                    est_c2w_aligned = est_c2w_full.clone()
+                    est_c2w_aligned[:, :3, 3] = est_centers_aligned
+
+                    # Back to w2c
+                    est_w2c_aligned = torch.linalg.inv(est_c2w_aligned)
+
+                    # Print post mapping center diff stats vs ref distribution (not 1-1).
+                    mu_aligned = est_centers_aligned.mean(dim=0)
+                    sigma_aligned = (est_centers_aligned - mu_aligned).norm(dim=1).mean().item()
+                    print(
+                        "[gs_views][align] gauge_map(post): "
+                        f"mu_ref={mu_ref.cpu().numpy()}, mu_est_aligned={mu_aligned.cpu().numpy()}, sigma_est_aligned={sigma_aligned:.6f}"
+                    )
+
+                aligned_batches.append(est_w2c_aligned.cpu())
+
+            tgt_extrs = torch.stack(aligned_batches, dim=0).to(tgt_extrs_44)
+    else:
+        tgt_extrs = ref_extrs
 
     tgt_intrs = (
         intrinsics
