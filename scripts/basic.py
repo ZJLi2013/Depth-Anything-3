@@ -6,6 +6,7 @@ from typing import List
 
 import numpy as np
 import torch
+from PIL import Image
 
 from depth_anything_3.api import DepthAnything3
 from depth_anything_3.utils.camera_trj_helpers import cam_trace_visualization
@@ -69,6 +70,14 @@ def main() -> None:
         default=None,
         help="Device override: cuda/cpu. Default: cuda if available else cpu.",
     )
+    parser.add_argument(
+        "--process-res-to-input",
+        action="store_true",
+        help=(
+            "If set, infer process_res from the first input image longest side (may use more VRAM). "
+            "Default: disabled, use process_res=504."
+        ),
+    )
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -77,6 +86,17 @@ def main() -> None:
     print(f"Found {len(images)} images in {args.input_images}")
     if len(images) == 0:
         raise ValueError("No images found. Supported formats: png, jpg, jpeg (case-insensitive)")
+
+    # process_res controls InputProcessor resize (target LONGEST side, then made divisible by patch size).
+    # Default is 504 to save VRAM. Optionally align to input image size.
+    if args.process_res_to_input:
+        with Image.open(images[0]) as im:
+            w0, h0 = im.size
+        process_res = max(h0, w0)
+        print(f"[INFO] Using process_res={process_res} inferred from first input image size (H,W)=({h0},{w0})")
+    else:
+        process_res = 504
+        print("[INFO] Using default process_res=504 (enable --process-res-to-input to align to input image size)")
 
     # Parse frame_ids from input image file names in the SAME order as `images`.
     # frame_ids[i] aligns with any prediction outputs in view dimension i.
@@ -212,6 +232,7 @@ def main() -> None:
         render_exts=render_exts,
         render_ixts=render_ixts,
         render_hw=render_hw,
+        process_res=process_res,
         export_dir=args.output_dir,
         export_format=export_format,
     )
